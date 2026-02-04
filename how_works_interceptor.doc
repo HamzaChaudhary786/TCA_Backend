@@ -1,0 +1,64 @@
+
+##########################################################
+
+we use pre method to run interceptor between mongodb query
+
+###########################################################
+
+
+const mongoose = require('mongoose');
+
+// Classroom Schema
+const classroomSchema = new mongoose.Schema({
+  name: String,
+  tenantID: String, // Tenant-specific field
+  // Other fields
+});
+
+// Middleware to enforce tenant filtering
+classroomSchema.pre(/^find/, function (next) {
+  // Assuming tenantID is stored in the request context (e.g., req.tenantID)
+  const tenantID = this.tenantID || global.tenantID; // Replace with your logic
+
+  if (!tenantID) {
+    return next(new Error('Tenant ID is missing.'));
+  }
+
+  // Add tenantID condition to the query
+  this.find({ tenantID }); // Adds tenantID filter
+  next();
+});
+
+// Classroom Model
+const Classroom = mongoose.model('Classroom', classroomSchema);
+
+module.exports = Classroom;
+
+
+
+###################################################################
+
+we get first tenantID from the login user and get in headers request 
+
+##################################################################
+
+// In this line we get tenantID from headers request and set globally to use everywhere we also get req.user or req.headers
+
+global.tenantID = req.headers['tenant-id']; 
+
+const getClassroom = async (req, res) => {
+  try {
+    const { classroomID } = req.params;
+
+    // Find classroom (interceptor will automatically add tenant filter)
+    const classroom = await Classroom.findById(classroomID);
+
+    if (!classroom) {
+      return res.status(404).json({ message: 'Classroom not found' });
+    }
+
+    res.status(200).json(classroom);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};

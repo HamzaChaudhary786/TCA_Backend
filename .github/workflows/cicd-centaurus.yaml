@@ -1,0 +1,80 @@
+name: TCA_Centaurus
+
+on:
+  push:
+    branches:
+      - release/centaurus
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Login to Docker Hub
+        run: docker login -u ${{ vars.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+      - name: Build Docker Image
+        run: docker build --no-cache -t timetechnologiesllc/tca_prod .
+      - name: Publish this image to docker hub
+        run: docker push timetechnologiesllc/tca_prod:latest
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.7.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_KEY_CENT }}
+
+      - name: SSH into EC2 and run Certbot
+        uses: appleboy/ssh-action@v1.0.3
+        with: 
+          host: ${{ vars.EC2_IP_CENT }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY_CENT }}
+          script: |
+            whoami
+            sudo apt-get update
+            sudo apt-get install -y software-properties-common
+            sudo add-apt-repository universe
+            sudo add-apt-repository ppa:certbot/certbot
+            sudo apt-get update
+            sudo apt-get install -y certbot
+
+            sudo systemctl stop nginx || true
+            sudo systemctl stop apache2 || true
+
+            sudo certbot certonly --standalone --non-interactive --agree-tos --email timetechnologiesllc@gmail.com -d 	tcabe.educativecloud.com
+            
+            CERT_PATH="/etc/letsencrypt/live/tcabe.educativecloud.com/fullchain.pem"
+            KEY_PATH="/etc/letsencrypt/live/tcabe.educativecloud.com/privkey.pem"
+
+          
+            sudo docker login -u ${{ vars.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+
+            sudo docker rm -f tca-container
+            sudo docker system prune -a -f
+            sudo docker pull timetechnologiesllc/tca_prod:latest
+            
+            sudo docker run -d -p 8080:80 -p 8443:443 --name tca-container -v $CERT_PATH:/etc/letsencrypt/live/tcabe.educativecloud.com/fullchain.pem -v $KEY_PATH:/etc/letsencrypt/live/tcabe.educativecloud.com/privkey.pem  -e MONGO_CONNECTION='${{ secrets.MONGO_URI_TCS_CENT }}' -e NODE_ENV='production' -e PORT='${{ vars.PORT }}' -e CLIENT_BASE_URL='${{secrets.CLIENT_BASE_URL}}' timetechnologiesllc/tca_prod
+
+ 
+  renew_ssl:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.7.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_KEY_CENT }}
+
+      - name: SSH into EC2 and renew SSL
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ vars.EC2_IP_CENT }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY_CENT }}
+          script: | 
+            sudo certbot renew --non-interactive
+            sudo docker restart tca-container

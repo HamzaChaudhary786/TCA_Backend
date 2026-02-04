@@ -1,0 +1,59 @@
+name: TCS
+
+on:
+  push:
+    branches:
+      - release/tcs
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        run: sudo docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build Docker Image
+        run: sudo docker build --no-cache -t timetechnologiesllc/tca_prod .
+
+      - name: Publish this image to docker hub
+        run: sudo docker push timetechnologiesllc/tca_prod:latest
+
+  deploy:
+    needs: build
+    runs-on: tcs-ravi
+    steps:
+
+      - name: Stop any conflicting services
+        run: |
+          sudo systemctl stop nginx || true
+          sudo systemctl stop apache2 || true
+
+      - name: Obtain/Renew Certificate
+        run: |
+          sudo certbot certonly --standalone --non-interactive --agree-tos --email timetechnologiesllc@gmail.com -d tcsbe.educativecloud.com
+
+      - name: Login to Docker Hub
+        run: sudo docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Deploy Container
+        run: |
+          CERT_PATH="/etc/letsencrypt/live/tcsbe.educativecloud.com/fullchain.pem"
+          KEY_PATH="/etc/letsencrypt/live/tcsbe.educativecloud.com/privkey.pem"
+
+          sudo docker rm -f tca-container || true
+          sudo docker system prune -a -f
+          sudo docker pull timetechnologiesllc/tca_prod:latest
+
+          sudo docker run -d \
+            -p 8080:80 -p 8443:443 \
+            --name tca-container \
+            -v $CERT_PATH:/etc/letsencrypt/live/tcsbe.educativecloud.com/fullchain.pem \
+            -v $KEY_PATH:/etc/letsencrypt/live/tcsbe.educativecloud.com/privkey.pem \
+            -e MONGO_CONNECTION='${{ secrets.MONGO_URI_TCS }}' \
+            -e NODE_ENV='production' \
+            -e PORT='${{ secrets.PORT }}' \
+            -e CLIENT_BASE_URL='${{ secrets.CLIENT_BASE_URL }}' \
+            timetechnologiesllc/tca_prod
