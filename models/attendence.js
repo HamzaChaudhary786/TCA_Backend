@@ -35,6 +35,10 @@ const attendanceSchema = new mongoose.Schema({
     ],
 });
 
+// Ensure one attendance document per entity/day and speed lookups
+attendanceSchema.index({ entityId: 1, Date: 1 }, { unique: true });
+attendanceSchema.index({ "students.studentID": 1 });
+
 const Attendance = mongoose.model("Attendance", attendanceSchema);
 
 module.exports = Attendance;

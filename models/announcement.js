@@ -27,6 +27,10 @@ const announcementSchema = new mongoose.Schema({
   { timestamps: true }
 );
 
+// Indexes for common announcement filters
+announcementSchema.index({ visibility: 1 });
+announcementSchema.index({ date: -1 });
+
 const Announcement = mongoose.model("Announcement", announcementSchema);
 
 module.exports = Announcement;

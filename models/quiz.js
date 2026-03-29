@@ -74,6 +74,11 @@ const quizSchema = new mongoose.Schema({
   },
 });
 
-const Assignment = mongoose.model("Quiz", quizSchema);
+// Indexes for frequent quiz queries
+quizSchema.index({ classroomID: 1, subjectID: 1 });
+quizSchema.index({ createdBy: 1 });
+quizSchema.index({ dueDate: 1 });
 
-module.exports = Assignment;
+const Quiz = mongoose.model("Quiz", quizSchema);
+
+module.exports = Quiz;

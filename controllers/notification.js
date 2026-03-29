@@ -5,7 +5,7 @@ exports.getNotifications = async (req, res) => {
     const notifications = await Notification.find({
       deliveredTo: req.user._id,
     })
-      .populate("sentBy")
+      .populate("userID")
       .sort({ createdAt: -1 });
 
     res.status(200).json(

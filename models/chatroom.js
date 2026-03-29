@@ -44,6 +44,11 @@ const chatroomSchema = new mongoose.Schema({
   },
 });
 
+// Indexes for common lookups (by classroom or participant)
+chatroomSchema.index({ classroomID: 1 });
+chatroomSchema.index({ participants: 1 });
+chatroomSchema.index({ "lastMsg.time": -1 });
+
 const Chatroom = mongoose.model("Chatroom", chatroomSchema);
 
 module.exports = Chatroom;

@@ -21,7 +21,11 @@ parentRouter.get(
 
 parentRouter.get("/children/:email", parentController.getChildrenOfParent);
 
-
+parentRouter.get(
+  "/child-assignments/:studentID",
+  isStudentChild,
+  parentController.getChildAssignments
+);
 
 
 parentRouter.get(

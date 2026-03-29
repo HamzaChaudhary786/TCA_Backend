@@ -7,9 +7,9 @@ const whatsappController = require("../../controllers/whatsapp/whatsapp");
 
 // whatsappRouter.param("tenant", fillTenantInfo);
 
-whatsappRouter.post("/:tenant", whatsappController.createWebHook);
-whatsappRouter.get("/:tenant", whatsappController.getWebHook);
-whatsappRouter.post("/:tenant/broadcast",
+whatsappRouter.post("/", whatsappController.createWebHook);
+whatsappRouter.get("/", whatsappController.getWebHook);
+whatsappRouter.post("/broadcast",
     // checkIsAdmin,
     whatsappController.sendAdminBroadcast);
 module.exports = whatsappRouter;

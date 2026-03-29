@@ -651,7 +651,7 @@ exports.cancelClass = async (req, res, next) => {
     }
 
     // delete class
-    await classs.remove();
+    await Class.findByIdAndDelete(req.params.id);
     return res.status(200).send(classs._doc);
   } catch (err) {
     next(err);
@@ -1028,8 +1028,8 @@ exports.submitAttendence = async (req, res, next) => {
       return res.status(404).json({ message: "Class not found" });
     }
 
-    // Update attendance for the class
-    await Class.findByIdAndUpdate(id, { attendance: data }, { new: true });
+    // Move update attendance for the class below after head teacher check
+    // await Class.findByIdAndUpdate(id, { attendance: data }, { new: true });
 
 
     // const settings = await Setting.findOne()
@@ -1128,13 +1128,34 @@ exports.submitAttendence = async (req, res, next) => {
     }
     // }
 
-    // Fetch today's start date (ensure it is in UTC)
-
+    // Update attendance for the class only if the head teacher check (and discrepancy check) passed
+    await Class.findByIdAndUpdate(id, { attendance: data }, { new: true });
 
     return res.status(200).json({ message: "Class attendance updated successfully!" });
+
   } catch (error) {
     console.error("Error occurred:", error.message);
     return res.status(500).json({ message: "Internal server error", error: error.message });
   }
 };
 
+exports.cancelAttendence = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    const updatedClass = await Class.findByIdAndUpdate(
+      id,
+      { $set: { attendance: [] } },
+      { new: true }
+    );
+
+    if (!updatedClass) {
+      return res.status(404).json({ message: "Class not found" });
+    }
+
+    return res.status(200).json({ message: "Attendance cancelled successfully!" });
+  } catch (error) {
+    console.error("Error cancelling attendance:", error.message);
+    return res.status(500).json({ message: "Internal server error", error: error.message });
+  }
+};

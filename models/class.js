@@ -74,6 +74,13 @@ const classSchema = new mongoose.Schema({
   ],
 });
 
+// Indexes for common query patterns
+classSchema.index({ classroomID: 1, startTime: 1 });
+classSchema.index({ subjectID: 1 });
+classSchema.index({ createdBy: 1 });
+classSchema.index({ "teacher.teacherID": 1 });
+classSchema.index({ "attendance.studentID": 1 });
+
 const Class = mongoose.model("Class", classSchema);
 
 module.exports = Class;

@@ -1,5 +1,11 @@
+const mongoose = require("mongoose");
 const Classroom = require("../models/classroom");
 const Quiz = require("../models/quiz");
+const Notification = require("../models/notification");
+const User = require("../models/user");
+const Subject = require("../models/subject");
+
+
 
 exports.createQuiz = async (req, res, next) => {
   const {
@@ -15,35 +21,23 @@ exports.createQuiz = async (req, res, next) => {
   const createdBy = req.user._id;
   try {
     //check if classroom exists and teacher is part of that classroom
-
     const classroom = await Classroom.findById(classroomID);
     if (!classroom) {
-      return res.status(404).send();
+      return res.status(404).json({ message: "Classroom not found" });
     }
 
     if (new Date() > new Date(dueDate)) {
       return res
         .status(400)
-        .send("Due date should be greater than current date");
+        .json({ message: "Due date should be greater than current date" });
     }
 
     const isTeacher = classroom.teachers.find(
       (tea) => tea.teacher.toString() == req.user._id.toString()
     );
     if (!isTeacher) {
-      return res.status(403).send();
+      return res.status(403).json({ message: "You are not a teacher in this classroom" });
     }
-
-    // check if teacher is assigned that subject in that classroom
-    // const isSubjectTeacher = classroom.teachers.find(
-    //   (tea) =>
-    //     tea.teacher.toString() == req.user._id.toString() &&
-    //     tea.subject.toString() == subjectID
-    // );
-
-    // if (!isSubjectTeacher) {
-    //   return res.status(403).send();
-    // }
 
     const quiz = new Quiz({
       title,
@@ -57,6 +51,49 @@ exports.createQuiz = async (req, res, next) => {
       subjectID,
     });
     await quiz.save();
+
+    // Create notifications for students and parents
+    const students = await User.find({ _id: { $in: classroom.students } });
+    const studentIds = students.map((s) => s._id);
+
+    // Collect all unique guardian emails and IDs
+    const guardianIds = new Set();
+    const guardianEmails = new Set();
+
+    students.forEach(s => {
+      if (s.guardianId) guardianIds.add(s.guardianId.toString());
+      if (s.guardianEmail) guardianEmails.add(s.guardianEmail);
+    });
+
+    // Find parent users who match the emails if they aren't already in the IDs set
+    if (guardianEmails.size > 0) {
+      const parentUsers = await User.find({ email: { $in: Array.from(guardianEmails) }, userType: "parent" });
+      parentUsers.forEach(p => guardianIds.add(p._id.toString()));
+    }
+
+    const parentIdsArray = Array.from(guardianIds).map(id => mongoose.Types.ObjectId(id));
+    const subject = await Subject.findById(subjectID);
+
+    if (studentIds.length > 0) {
+      await Notification.create({
+        userID: createdBy,
+        deliveredTo: studentIds,
+        message: `New quiz created: ${title}`,
+        subjectName: subject ? subject.name : "Subject",
+        classroomName: classroom.name,
+      });
+    }
+
+    if (parentIdsArray.length > 0) {
+      await Notification.create({
+        userID: createdBy,
+        deliveredTo: parentIdsArray,
+        message: `New quiz created for your child: ${title}`,
+        subjectName: subject ? subject.name : "Subject",
+        classroomName: classroom.name,
+      });
+    }
+
     res.status(201).send(quiz);
   } catch (error) {
     next(error);
@@ -67,26 +104,22 @@ exports.editQuiz = async (req, res, next) => {
   const { title, text, totalMarks, subjectID, dueDate, files, canSubmitAfterTime } = req.body;
   const { id } = req.params;
 
-  console.log(
-    subjectID, "subject id"
-  );
-
   try {
-    if (dueDate)
+    if (dueDate) {
       if (new Date() > new Date(dueDate)) {
         return res
           .status(400)
-          .send("Due date should be greater than current date");
+          .json({ message: "Due date should be greater than current date" });
       }
+    }
 
     // check if quiz exists and teacher who created quiz is editing it
-
     const quiz = await Quiz.findById(id);
     if (!quiz) {
-      return res.status(404).send();
+      return res.status(404).json({ message: "Quiz not found" });
     }
     if (quiz.createdBy.toString() !== req.user._id.toString()) {
-      return res.status(403).send();
+      return res.status(403).json({ message: "Unauthorized to edit this quiz" });
     }
 
     quiz.title = title ? title : quiz.title;
@@ -99,7 +132,7 @@ exports.editQuiz = async (req, res, next) => {
       ? canSubmitAfterTime
       : quiz.canSubmitAfterTime;
     await quiz.save();
-    res.send(quiz);
+    res.status(200).send(quiz);
   } catch (error) {
     next(error);
   }
@@ -168,6 +201,29 @@ exports.submitQuiz = async (req, res, next) => {
     };
     quiz.submissions.push(submission);
     await quiz.save();
+
+    // Create notifications for teacher and parent
+    let recipients = [quiz.createdBy];
+    if (req.user.guardianId) {
+      recipients.push(req.user.guardianId);
+    } else if (req.user.guardianEmail) {
+      const parent = await User.findOne({ email: req.user.guardianEmail, userType: "parent" });
+      if (parent) recipients.push(parent._id);
+    }
+
+    const populatedQuiz = await Quiz.findById(id).populate("subjectID classroomID");
+    await Notification.create({
+      userID: req.user._id,
+      deliveredTo: recipients,
+      message: `${req.user.name} submitted a quiz`,
+      subjectName: populatedQuiz.subjectID.name,
+      classroomName: populatedQuiz.classroomID.name,
+      file: {
+        name: file.split("/").pop() || "quiz",
+        url: file
+      }
+    });
+
     res.status(201).send(quiz);
   } catch (error) {
     next(error);
@@ -213,7 +269,28 @@ exports.gradeQuizes = async (req, res, next) => {
 
     // quiz.submissions = updatedSubmissions;
 
-    quiz.submissions = submissions;
+    // Update submissions: support students who haven't submitted yet
+    submissions.forEach((updatedSubmission) => {
+      const existingSubmission = quiz.submissions.find(
+        (s) => s.studentID.toString() === updatedSubmission.studentID.toString()
+      );
+
+      if (existingSubmission) {
+        // Update existing submission
+        existingSubmission.feedback = updatedSubmission.feedback !== undefined ? updatedSubmission.feedback : existingSubmission.feedback;
+        existingSubmission.grade = updatedSubmission.grade !== undefined ? updatedSubmission.grade : existingSubmission.grade;
+        existingSubmission.marks = updatedSubmission.marks !== undefined ? updatedSubmission.marks : existingSubmission.marks;
+      } else {
+        // Create new entry for students who haven't submitted
+        quiz.submissions.push({
+          studentID: updatedSubmission.studentID,
+          feedback: updatedSubmission.feedback || "",
+          grade: updatedSubmission.grade || "",
+          marks: updatedSubmission.marks !== undefined ? updatedSubmission.marks : 0,
+        });
+      }
+    });
+
     await quiz.save();
     res.send(quiz);
   } catch (error) {
@@ -263,7 +340,7 @@ exports.getAllQuizesOfTeacher = async (req, res, next) => {
         populate: [
           {
             path: "students",
-            select: "name email",
+            select: "name email levelID subjects",
             model: "User",
           },
           {
@@ -276,6 +353,10 @@ exports.getAllQuizesOfTeacher = async (req, res, next) => {
             select: "name",
             model: "Subject",
           },
+          {
+            path: "levelID",
+            model: "Level",
+          }
         ],
       });
 
@@ -328,7 +409,7 @@ exports.getAllQuizzesOfStudent = async (req, res, next) => {
     const classroomIDs = classrooms.map((c) => c._id);
     const quizzes = await Quiz.find({
       classroomID: { $in: classroomIDs },
-    }).populate("subjectID").populate("classroomID");
+    }).populate("subjectID").populate("classroomID").populate("createdBy");
 
     // check if user has submitted the assignment and add isSubmitted to each assignment
     const quizzesWithSubmission = quizzes.map((assignment) => {
@@ -361,13 +442,19 @@ exports.getQuizForGrading = async (req, res, next) => {
       return res.status(404).send();
     }
     const classroomID = quiz.classroomID;
-    const classroom = await Classroom.findById(classroomID).populate(
-      "students"
-    );
+    const classroom = await Classroom.findById(classroomID).populate({
+      path: "students",
+      select: "name email profilePic levelID subjects"
+    });
     if (!classroom) {
       return res.status(404).send();
     }
-    const students = classroom.students;
+
+    // Filter students: include if they are enrolled in the subject, or if they have no subjects assigned (fallback to all students in classroom)
+    const students = classroom.students.filter(student => {
+      if (!student.subjects || student.subjects.length === 0) return true;
+      return student.subjects.some(sub => sub.toString() === quiz.subjectID.toString());
+    });
 
     // return all students of classroom and check if they have submitted the quiz
     const submissions = students.map((studentID) => {

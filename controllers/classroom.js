@@ -2,6 +2,9 @@ const Classroom = require("../models/classroom");
 const Subject = require("../models/subject");
 const Class = require("../models/class");
 const Chatroom = require("../models/chatroom");
+const Assignment = require("../models/assignment");    
+const Quiz = require("../models/quiz");
+const StudentPromote = require("../models/studentPromote");
 const Level = require("../models/level");
 const classroomRepository = require("../repositories/classroomRepository");
 const levelRepository = require("../repositories/levelRepository");
@@ -497,11 +500,25 @@ exports.deleteClassroom = async (req, res, next) => {
     // Delete all classes in the classroom
     await Class.deleteMany({ classroomID: req.params.id });
 
-    // Delete the classroom
-    await Classroom.findByIdAndDelete(req.params.id);
-
     // Delete the chatroom
     await Chatroom.deleteMany({ classroomID: req.params.id });
+
+    // Delete related assignments
+    await Assignment.deleteMany({ classroomID: req.params.id });
+
+    // Delete related quizzes
+    await Quiz.deleteMany({ classroomID: req.params.id });
+
+    // Delete attendance records
+    await Attendance.deleteMany({ entityId: req.params.id, entityType: "classroom" });
+
+    // Delete related promotion history
+    await StudentPromote.deleteMany({
+      $or: [{ sourceClassroom: req.params.id }, { targetClassroom: req.params.id }]
+    });
+
+    // Delete the classroom
+    await Classroom.findByIdAndDelete(req.params.id);
 
     return res.status(204).send({ message: "Classroom deleted successfully" });
   } catch (err) {

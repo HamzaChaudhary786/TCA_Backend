@@ -7,7 +7,7 @@ userRouter.put("/update", controller.updateUser);
 
 userRouter.put("/admin/user/update-student-subject/:studentId", controller.updateStudentSubject);
 
-
+userRouter.post("/admin/bulk-update-student-subjects", controller.bulkUpdateStudentSubjects);
 
 // Logout route
 userRouter.get("/logout", controller.logout);
