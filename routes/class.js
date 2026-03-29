@@ -21,6 +21,9 @@ classRouter.put("/get-today-classes/:id", classController.submitAttendence);
 // reschedule class
 classRouter.put("/:id", classController.rescheduleClass);
 
+// cancel attendence
+classRouter.delete("/cancel-attendance/:id", classController.cancelAttendence);
+
 // cancel class
 classRouter.delete("/:id", classController.cancelClass);
 

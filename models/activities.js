@@ -23,6 +23,9 @@ const activitySchema = new mongoose.Schema({
   },
 });
 
+// Indexes for fast user activity lookups
+activitySchema.index({ userID: 1, loginTime: -1 });
+
 const Activity = mongoose.model("Activity", activitySchema);
 
 module.exports = Activity;

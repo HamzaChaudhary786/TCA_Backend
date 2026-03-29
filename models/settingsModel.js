@@ -29,6 +29,9 @@ const Settings = new mongoose.Schema({
   },
 });
 
+// Index settings by update time for quick retrieval of the latest settings
+Settings.index({ updatedAt: -1 });
+
 const Setting = mongoose.model("Setting", Settings);
 
 module.exports = Setting;

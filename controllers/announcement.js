@@ -15,15 +15,39 @@ exports.createAnnouncement = async (req, res, next) => {
 };
 exports.getAnnouncementsByType = async (req, res, next) => {
   try {
-    const announcements = await Announcement.find({ type: req.params.type })
+    const user = req.user;
+    const { type } = req.params;
+    let query = { type };
 
+    if (user && user.userType !== "admin") {
+      query.$or = [
+        { visibility: "all" },
+        { visibility: user.userType }
+      ];
+    }
+
+    const announcements = await Announcement.find(query).sort({ createdAt: -1 });
     return res.status(200).send(announcements);
-  } catch (err) { }
+  } catch (err) {
+    next(err);
+  }
 };
+
 exports.getAnnouncements = async (req, res, next) => {
   try {
-    const announcements = await Announcement.find()
+    const user = req.user;
+    let query = {};
 
+    if (user && user.userType !== "admin") {
+      query = {
+        $or: [
+          { visibility: "all" },
+          { visibility: user.userType }
+        ]
+      };
+    }
+
+    const announcements = await Announcement.find(query).sort({ createdAt: -1 });
     return res.status(200).send(announcements);
   } catch (err) {
     next(err);
@@ -53,43 +77,28 @@ exports.deleteAnnouncement = async (req, res, next) => {
   }
 };
 
-
-
-
 exports.getAnnouncementsByUserType = async (req, res, next) => {
   try {
-    // Get the userType of the logged-in user
-    const userId = req.user._id;  // Assuming you have userId from the session or JWT token
-
-    console.log(userId, "current user");
-
-    const user = await User.findById(userId);
-
-    console.log(user, "all user data");
-
+    const user = req.user;
 
     if (!user) {
-      return res.status(404).send({ message: "User not found" });
+      return res.status(401).send({ message: "Unauthorized" });
     }
 
     // Determine visibility for this user based on their userType
-    let visibilityFilter = 'all';  // Default to 'all' in case something goes wrong
+    let query = {};
 
-    if (user.userType === 'student') {
-      visibilityFilter = 'student';
-    } else if (user.userType === 'parent') {
-      visibilityFilter = 'parent';
-    } else if (user.userType === 'teacher') {
-      visibilityFilter = 'teacher';
+    if (user.userType !== "admin") {
+      query = {
+        $or: [
+          { visibility: "all" },
+          { visibility: user.userType },
+        ],
+      };
     }
 
     // Fetch announcements based on visibility
-    const announcements = await Announcement.find({
-      $or: [
-        { visibility: 'all' }, // Visible to everyone
-        { visibility: visibilityFilter }, // Visible based on the user's type
-      ],
-    }).sort({ createdAt: -1 });
+    const announcements = await Announcement.find(query).sort({ createdAt: -1 });
 
     return res.status(200).send(announcements);
 

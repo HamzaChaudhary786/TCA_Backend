@@ -1,18 +1,21 @@
 if (process.env.NODE_ENV !== "production") {
   require("dotenv").config();
 }
+console.log("Server starting... Gemini API Key:", process.env.GEMINI_API_KEY ? "Present" : "Missing");
 
 var createError = require("http-errors");
 var express = require("express");
 var path = require("path");
 var cookieParser = require("cookie-parser");
 var logger = require("morgan");
+const axios = require("axios");
 // const ZKJUBAER = require("zk-jubaer");
 const session = require("express-session");
 const cors = require("cors");
 const passport = require("passport"); // authentication
 const { initializingPassport } = require("./passportConfig");
 const MongoStore = require("connect-mongo");
+const rateLimit = require("express-rate-limit");
 
 const userRouter = require("./routes/user");
 
@@ -45,6 +48,7 @@ const { initializeAttendanceProcessing } = require("./db/attendanceDeviceDb");
 
 
 var app = express();
+app.set("trust proxy", 1);
 let isProduction = process.env.NODE_ENV == "production";
 app.use(logger("dev"));
 app.use(express.json());
@@ -53,10 +57,10 @@ app.use(cookieParser());
 app.use(
   cors({
     credentials: true,
-    origin: isProduction
-      ? ["https://tca-frontend-sync-git-main-zees-projects-3a466cf5.vercel.app", "https://tca-frontend-sync-git-lms-123-nit-demo-zees-projects-3a466cf5.vercel.app", "https://tca.educativecloud.com", "https://tcsravi.educativecloud.com", "https://tcsshalimar.educativecloud.com", "*"]  // Production URLs only
-      : ["http://localhost:5173", "*"],
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    origin: process.env.ALLOWED_ORIGINS
+      ? process.env.ALLOWED_ORIGINS.split(",")
+      : (isProduction ? ["https://tecveq-frontend.onrender.com"] : ["http://localhost:5173", "http://localhost:4173"]),
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
@@ -74,6 +78,7 @@ app.use(
       ? {
         secure: true,
         sameSite: "none",
+        httpOnly: true,
       }
       : {
         sameSite: "lax", // "none" for cross-origin, "lax" for development
@@ -89,28 +94,41 @@ app.use(passport.session());
 app.use("/api/auth/", authRouter);
 app.use("/api/subscription", checkLoggedIn, require("./routes/subscription"));
 app.use("/api/level/", levelRouter);
-app.use("/api/quiz/", checkLoggedIn, checkSubscription, quizRouter);
-app.use("/api/user/", checkLoggedIn, checkSubscription, userRouter);
+app.use("/api/quiz/", checkLoggedIn, quizRouter);
+app.use("/api/user/", checkLoggedIn, userRouter);
 app.use("/api/class/",
-  // checkLoggedIn,
+  checkLoggedIn,
   classRouter);
-app.use("/api/subject/", checkLoggedIn, checkSubscription, subjectRouter);
-app.use("/api/feedback/", checkLoggedIn, checkSubscription, feedbackRouter);
-app.use("/api/classroom/", checkLoggedIn, checkSubscription, classoomRouter);
+app.use("/api/subject/", checkLoggedIn, subjectRouter);
+app.use("/api/feedback/", checkLoggedIn, feedbackRouter);
+app.use("/api/classroom/", checkLoggedIn, classoomRouter);
 app.use(
   "/api/classroom/attendence",
   checkLoggedIn,
   attendenceRouter);
-app.use("/api/assignment/", checkLoggedIn, checkSubscription, assignmentRouter);
-app.use("/api/assignment/", checkLoggedIn, checkSubscription, assignmentRouter);
-app.use("/api/settings/", checkLoggedIn, checkSubscription, settingsRouter);
-app.use("/api/notification/", checkLoggedIn, checkSubscription, notificationRouter);
-app.use("/api/announcement/", checkLoggedIn, checkSubscription, announcementRouter);
+app.use("/api/assignment/", checkLoggedIn, assignmentRouter);
+app.use("/api/assignment/", checkLoggedIn, assignmentRouter);
+app.use("/api/settings/", checkLoggedIn, settingsRouter);
+app.use("/api/notification/", checkLoggedIn, notificationRouter);
+app.use("/api/announcement/", checkLoggedIn, announcementRouter);
 app.use("/api/parent", require("./routes/parent"));
 app.use("/api/upload/", require("./routes/uploadCSVFile"));
-app.use("/api/chatroom/", checkLoggedIn, checkSubscription, require("./routes/chatroom"));
+app.use("/api/chatroom/", checkLoggedIn, require("./routes/chatroom"));
 app.use("/webhook", require("./routes/whatsapp/whatsapp"));
-app.use("/api/admin/", checkLoggedIn, checkSubscription, promoteRouter);
+app.use("/api/admin/", checkLoggedIn, promoteRouter);
+app.use("/api/stats/", checkLoggedIn, require("./routes/stats"));
+
+const aiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 3, // 3 requests per minute per user
+  message: {
+    success: false,
+    message: "Too many requests from this IP, please try again after a minute",
+  },
+});
+
+app.use("/api/chat/", checkLoggedIn, aiLimiter, require("./routes/chat"));
+
 
 
 
@@ -138,13 +156,11 @@ app.get("/developers", (req, res) => {
 //check levels in productions
 app.get("/dbHealth", async (req, res) => {
   try {
-    const levels = await Level.find();
-    const users = await User.find();
 
     res.status(200).send({
       success: true,
-      data: levels,
-      user: users
+      message: "Database connection is healthy and levels data is accessible.",
+
     });
   } catch (error) {
     console.error("Error fetching levels data:", error.message);
@@ -201,7 +217,7 @@ app.use(function (err, req, res, next) {
 const db = process.env.MONGO_CONNECTION;
 mongoose.connect(
   db,
-  { useNewUrlParser: true, useUnifiedTopology: true, useFindAndModify: true, tlsAllowInvalidCertificates: true },
+  { useNewUrlParser: true, useUnifiedTopology: true, useFindAndModify: true },
   (err) => {
     if (err) {
       console.log(err);
@@ -211,25 +227,45 @@ mongoose.connect(
     }
   }
 );
-var port = isProduction ? 443 : 4000;
-const sslOptions = isProduction
+var port = process.env.PORT || (isProduction ? 443 : 4000);
+const sslKeyPath = process.env.SSL_KEY_PATH;
+const sslCertPath = process.env.SSL_CERT_PATH;
+const sslOptions = (isProduction && sslKeyPath && sslCertPath && fs.existsSync(sslKeyPath) && fs.existsSync(sslCertPath))
   ? {
-    key: fs.readFileSync("/etc/letsencrypt/live/tca.educativecloud.com/privkey.pem"),
-    cert: fs.readFileSync("/etc/letsencrypt/live/tca.educativecloud.com/fullchain.pem"),
+    key: fs.readFileSync(sslKeyPath),
+    cert: fs.readFileSync(sslCertPath),
   }
-  : undefined;
-var server = isProduction
+  : null;
+
+var server = (sslOptions)
   ? https.createServer(sslOptions, app)
   : http.createServer(app);
+
 io.attach(server);
-server.listen(port, () => {
-  if (isProduction) {
-    console.log(`AWS Server is running on port ${443}`);
-  } else {
-    console.log(`Server is running on port ${port}`);
+server.listen(port, async () => {
+  console.log(`Server is running on port ${port} ${sslOptions ? '(SSL enabled)' : ''}`);
+
+  // Log ngrok URL when running locally (ngrok must be running)
+  if (process.env.NODE_ENV !== "production") {
+    try {
+      const res = await axios.get("http://127.0.0.1:4040/api/tunnels");
+      const tunnels = Array.isArray(res.data.tunnels) ? res.data.tunnels : [];
+      const httpsTunnel = tunnels.find((t) => t.public_url?.startsWith("https://"));
+      const tunnel = httpsTunnel || tunnels[0];
+
+      if (tunnel && tunnel.public_url) {
+        console.log(`ngrok public URL: ${tunnel.public_url}`);
+        console.log(`Webhook URL: ${tunnel.public_url}/webhook/<tenant>`);
+      } else {
+        console.log("ngrok tunnel not found. Is ngrok running? (ngrok http <port>)");
+      }
+    } catch (err) {
+      console.log("Unable to query ngrok API (http://127.0.0.1:4040/api/tunnels).", err.message);
+    }
   }
 });
-isProduction &&
+
+if (isProduction && sslOptions && process.env.REDIRECT_HTTP !== "false") {
   http
     .createServer((req, res) => {
       res.writeHead(301, {
@@ -238,6 +274,7 @@ isProduction &&
       res.end();
     })
     .listen(80);
+}
 server.on("error", onError);
 server.on("listening", onListening);
 function normalizePort(val) {

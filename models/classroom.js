@@ -40,6 +40,12 @@ const classroomSchema = new mongoose.Schema({
  
 });
 
+// Indexes to speed classroom lookups
+classroomSchema.index({ name: 1, levelID: 1 }, { unique: true });
+classroomSchema.index({ levelID: 1 });
+classroomSchema.index({ students: 1 });
+classroomSchema.index({ "teachers.teacher": 1 });
+
 const Classroom = mongoose.model("Classroom", classroomSchema);
 
 module.exports = Classroom;

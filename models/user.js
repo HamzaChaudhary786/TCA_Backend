@@ -109,6 +109,11 @@ const userSchema = new mongoose.Schema({
 
 });
 
+// Indexes for frequent queries
+userSchema.index({ userType: 1, guardianEmail: 1 });
+userSchema.index({ userType: 1, guardianPhoneNumber: 1 });
+userSchema.index({ levelID: 1 });
+
 const User = mongoose.model("User", userSchema);
 
 module.exports = User;

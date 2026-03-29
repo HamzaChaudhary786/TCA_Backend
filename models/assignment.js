@@ -73,6 +73,11 @@ const assignmentSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+// Indexes for query patterns (classroom, subject, creator)
+assignmentSchema.index({ classroomID: 1, subjectID: 1 });
+assignmentSchema.index({ createdBy: 1 });
+assignmentSchema.index({ dueDate: 1 });
+
 const Assignment = mongoose.model("Assignment", assignmentSchema);
 
 module.exports = Assignment;

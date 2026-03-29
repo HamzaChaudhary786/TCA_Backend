@@ -22,6 +22,9 @@ const chatSchema = new mongoose.Schema({
     }
 )
 
+// Index for quick chat lookups by participant
+chatSchema.index({ participants: 1 });
+
 const Chats = mongoose.model("Chats", chatSchema);
 
 module.exports = Chats

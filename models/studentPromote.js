@@ -68,7 +68,10 @@ const studentPromoteSchema = new mongoose.Schema({
     timestamps: true
 });
 
-
+// Indexes for efficient promotion lookups
+studentPromoteSchema.index({ sourceClassroom: 1, sourceLevel: 1 });
+studentPromoteSchema.index({ targetClassroom: 1, targetLevel: 1 });
+studentPromoteSchema.index({ promotorDate: -1 });
 
 const StudentPromote = mongoose.model("StudentPromote", studentPromoteSchema);
 

@@ -1,5 +1,11 @@
+const mongoose = require("mongoose");
 const Assignment = require("../models/assignment");
 const Classroom = require("../models/classroom");
+const Notification = require("../models/notification");
+const User = require("../models/user");
+const Subject = require("../models/subject");
+
+
 
 exports.createAssignment = async (req, res, next) => {
   const { title, text, totalMarks, dueDate, files, classroomID, subjectID } =
@@ -48,6 +54,49 @@ exports.createAssignment = async (req, res, next) => {
       subjectID,
     });
     await assignment.save();
+
+    // Create notifications for students and parents
+    const students = await User.find({ _id: { $in: classroom.students } });
+    const studentIds = students.map((s) => s._id);
+
+    // Collect all unique guardian emails and IDs
+    const guardianIds = new Set();
+    const guardianEmails = new Set();
+
+    students.forEach(s => {
+      if (s.guardianId) guardianIds.add(s.guardianId.toString());
+      if (s.guardianEmail) guardianEmails.add(s.guardianEmail);
+    });
+
+    // Find parent users who match the emails if they aren't already in the IDs set
+    if (guardianEmails.size > 0) {
+      const parentUsers = await User.find({ email: { $in: Array.from(guardianEmails) }, userType: "parent" });
+      parentUsers.forEach(p => guardianIds.add(p._id.toString()));
+    }
+
+    const parentIdsArray = Array.from(guardianIds).map(id => mongoose.Types.ObjectId(id));
+    const subject = await Subject.findById(subjectID);
+
+    if (studentIds.length > 0) {
+      await Notification.create({
+        userID: createdBy,
+        deliveredTo: studentIds,
+        message: `New assignment created: ${title}`,
+        subjectName: subject ? subject.name : "Subject",
+        classroomName: classroom.name,
+      });
+    }
+
+    if (parentIdsArray.length > 0) {
+      await Notification.create({
+        userID: createdBy,
+        deliveredTo: parentIdsArray,
+        message: `New assignment created for your child: ${title}`,
+        subjectName: subject ? subject.name : "Subject",
+        classroomName: classroom.name,
+      });
+    }
+
     res.status(201).send(assignment);
   } catch (error) {
     next(error);
@@ -62,21 +111,29 @@ exports.editAssignment = async (req, res, next) => {
   const { id } = req.params;
   try {
     // check if dueDate is greater than current date
-    if (dueDate)
+    if (dueDate) {
       if (new Date() > new Date(dueDate)) {
         return res
           .status(400)
-          .send("Due date should be greater than current date");
+          .json({ message: "Due date should be greater than current date" });
       }
+    }
 
     // check if assignment exists and teacher who created assignment is editing it
-
     const assignment = await Assignment.findById(id);
     if (!assignment) {
-      return res.status(404).send();
+      return res.status(404).json({ message: "Assignment not found" });
     }
     if (assignment.createdBy.toString() !== req.user._id.toString()) {
-      return res.status(403).send();
+      return res.status(403).json({ message: "Unauthorized to edit this assignment" });
+    }
+
+    // Validate classroom if provided
+    if (classroomID) {
+      const classroom = await Classroom.findById(classroomID);
+      if (!classroom) {
+        return res.status(404).json({ message: "Classroom not found" });
+      }
     }
 
     //if title or totalMarks or dueDate or files is not provided, use the old value
@@ -156,7 +213,7 @@ exports.getAllAssignmentsOfTeacher = async (req, res, next) => {
         populate: [
           {
             path: "students",
-            select: "name email",
+            select: "name email levelID subjects",
             model: "User",
           },
           {
@@ -168,6 +225,10 @@ exports.getAllAssignmentsOfTeacher = async (req, res, next) => {
             path: "teachers.subject",
             select: "name",
             model: "Subject",
+          },
+          {
+            path: "levelID",
+            model: "Level",
           }
         ],
       });
@@ -229,6 +290,29 @@ exports.submitAssignment = async (req, res, next) => {
     };
     assignment.submissions.push(submission);
     await assignment.save();
+
+    // Create notifications for teacher and parent
+    let recipients = [assignment.createdBy];
+    if (req.user.guardianId) {
+      recipients.push(req.user.guardianId);
+    } else if (req.user.guardianEmail) {
+      const parent = await User.findOne({ email: req.user.guardianEmail, userType: "parent" });
+      if (parent) recipients.push(parent._id);
+    }
+
+    const populatedAssignment = await Assignment.findById(id).populate("subjectID classroomID");
+    await Notification.create({
+      userID: studentID,
+      deliveredTo: recipients,
+      message: `${req.user.name} submitted an assignment`,
+      subjectName: populatedAssignment.subjectID.name,
+      classroomName: populatedAssignment.classroomID.name,
+      file: {
+        name: file.split("/").pop() || "assignment",
+        url: file
+      }
+    });
+
     res.status(201).send(assignment);
   } catch (error) {
     next(error);
@@ -257,25 +341,26 @@ exports.gradeAssignments = async (req, res, next) => {
       return res.status(400).send("Invalid marks: Marks exceed total marks");
     }
 
-    // Update submissions
-    assignment.submissions = assignment.submissions.map((existingSubmission) => {
-      // Find the matching submission from the request payload
-      const updatedSubmission = submissions.find(
-        (s) => s.studentID.toString() === existingSubmission.studentID.toString()
+    // Update submissions: support students who haven't submitted yet
+    submissions.forEach((updatedSubmission) => {
+      const existingSubmission = assignment.submissions.find(
+        (s) => s.studentID.toString() === updatedSubmission.studentID.toString()
       );
 
-      // If there's an update for this student, merge it with the existing data
-      if (updatedSubmission) {
-        return {
-          ...existingSubmission.toObject(), // Keep existing fields (e.g., file, submittedAt)
-          feedback: updatedSubmission.feedback || existingSubmission.feedback,
-          grade: updatedSubmission.grade || existingSubmission.grade,
-          marks: updatedSubmission.marks || existingSubmission.marks,
-        };
+      if (existingSubmission) {
+        // Update existing submission
+        existingSubmission.feedback = updatedSubmission.feedback !== undefined ? updatedSubmission.feedback : existingSubmission.feedback;
+        existingSubmission.grade = updatedSubmission.grade !== undefined ? updatedSubmission.grade : existingSubmission.grade;
+        existingSubmission.marks = updatedSubmission.marks !== undefined ? updatedSubmission.marks : existingSubmission.marks;
+      } else {
+        // Create new entry for students who haven't submitted
+        assignment.submissions.push({
+          studentID: updatedSubmission.studentID,
+          feedback: updatedSubmission.feedback || "",
+          grade: updatedSubmission.grade || "",
+          marks: updatedSubmission.marks !== undefined ? updatedSubmission.marks : 0,
+        });
       }
-
-      // If no update, return the existing submission as-is
-      return existingSubmission;
     });
 
     // Save the updated assignment
@@ -316,7 +401,7 @@ exports.getAllAssignmentsOfStudent = async (req, res, next) => {
     const classroomIDs = classrooms.map((c) => c._id);
     const assignments = await Assignment.find({
       classroomID: { $in: classroomIDs },
-    }).populate("subjectID").populate("classroomID");
+    }).populate("subjectID").populate("classroomID").populate("createdBy");
 
     // check if user has submitted the assignment and add isSubmitted to each assignment
     const assignmentsWithSubmission = assignments.map((assignment) => {
@@ -349,13 +434,19 @@ exports.getAssignmentForGrading = async (req, res, next) => {
       return res.status(404).send();
     }
     const classroomID = assignment.classroomID;
-    const classroom = await Classroom.findById(classroomID).populate(
-      "students"
-    );
+    const classroom = await Classroom.findById(classroomID).populate({
+      path: "students",
+      select: "name email profilePic levelID subjects"
+    });
     if (!classroom) {
       return res.status(404).send();
     }
-    const students = classroom.students;
+
+    // Filter students: include if they are enrolled in the subject, or if they have no subjects assigned (fallback to all students in classroom)
+    const students = classroom.students.filter(student => {
+      if (!student.subjects || student.subjects.length === 0) return true;
+      return student.subjects.some(sub => sub.toString() === assignment.subjectID.toString());
+    });
 
     // return all students of classroom and check if they have submitted the assignment
     const submissions = students.map((studentID) => {
