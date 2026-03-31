@@ -1,11 +1,4 @@
-const StudentPromote = require('../models/studentPromote');
-const Classroom = require('../models/classroom');
-const Attendance = require('../models/attendence');
-const Assignment = require('../models/assignment');
-const Quiz = require('../models/quiz');
-const Class = require('../models/class');
-const ArchivedReport = require('../models/archivedReport');
-const User = require('../models/user');
+const prisma = require("../db/prisma");
 
 const createStudentPromotion = async (req, res) => {
   try {
@@ -20,9 +13,14 @@ const createStudentPromotion = async (req, res) => {
 
     const currUser = req.user;
 
-    // Validate Classrooms
-    const srcClassroom = await Classroom.findById(sourceClassroom);
-    const tgtClassroom = await Classroom.findById(targetClassroom);
+    const srcClassroom = await prisma.classroom.findUnique({
+      where: { id: sourceClassroom },
+      include: { students: true }
+    });
+    const tgtClassroom = await prisma.classroom.findUnique({
+      where: { id: targetClassroom },
+      include: { students: true }
+    });
 
     if (!srcClassroom || !tgtClassroom) {
       return res.status(404).json({ success: false, message: 'Source or target classroom not found' });
@@ -30,132 +28,136 @@ const createStudentPromotion = async (req, res) => {
 
     const studentIds = students.map(s => s.id);
 
-    // 1. Gather & Archive Data for each student
-    const archivedReports = [];
-    for (const student of students) {
-      // Get attendance records for this student in the source classroom
-      const attendances = await Attendance.find({ entityId: sourceClassroom, entityType: "classroom", "students.studentID": student.id });
+    // 1. Wrap the entire promotion process in a transaction
+    const result = await prisma.$transaction(async (tx) => {
+      // 1. Gather & Archive Data for each student
+      for (const student of students) {
+        // Get attendance
+        const attendanceRecords = await tx.attendanceRecord.findMany({
+          where: { studentID: student.id, attendance: { entityId: sourceClassroom } },
+          include: { attendance: true }
+        });
 
-      const studentAttendance = attendances.map(att => {
-        const record = att.students.find(s => s.studentID.toString() === student.id.toString());
-        return {
-          date: att.Date,
-          isPresent: record ? record.isPresent : false,
-          late: record ? record.late : false,
-        };
-      }).filter(a => a !== null);
+        // Get assignments
+        const submissions = await tx.assignmentSubmission.findMany({
+          where: { studentID: student.id, assignment: { classroomID: sourceClassroom } },
+          include: { assignment: true }
+        });
 
-      // Get assignments
-      const assignments = await Assignment.find({ classroomID: sourceClassroom, "submissions.studentID": student.id });
-      const studentAssignments = assignments.map(asn => {
-        const sub = asn.submissions.find(s => s.studentID.toString() === student.id.toString());
-        return {
-          assignmentID: asn._id,
-          title: asn.title,
-          totalMarks: asn.totalMarks,
-          obtainedMarks: sub ? sub.marks : null,
-          grade: sub ? sub.grade : null,
-          feedback: sub ? sub.feedback : null,
-          submittedAt: sub ? sub.submittedAt : null,
-        };
+        // Get quizzes
+        const quizSubmissions = await tx.quizSubmission.findMany({
+          where: { studentID: student.id, quiz: { classroomID: sourceClassroom } },
+          include: { quiz: true }
+        });
+
+        // Get Scheduled Classes and Attendance
+        const classAttendances = await tx.classAttendance.findMany({
+          where: { studentID: student.id, class: { classroomID: sourceClassroom } },
+          include: { class: true }
+        });
+
+        // Prepare archive document (Mapping to Prisma schema for ArchivedReport)
+        await tx.archivedReport.create({
+          data: {
+            studentID: student.id,
+            sourceClassroomID: sourceClassroom,
+            targetClassroomID: targetClassroom,
+            promotionDate: new Date(),
+            attendance: {
+              create: attendanceRecords.map(ar => ({
+                date: ar.attendance.date,
+                isPresent: ar.isPresent,
+                late: ar.late
+              }))
+            },
+            assignments: {
+              create: submissions.map(s => ({
+                assignmentID: s.assignmentID,
+                title: s.assignment.title,
+                totalMarks: s.assignment.totalMarks,
+                obtainedMarks: s.marks || 0,
+                grade: s.grade || "",
+                feedback: s.feedback || "",
+                submittedAt: s.submittedAt || new Date()
+              }))
+            },
+            quizzes: {
+              create: quizSubmissions.map(s => ({
+                quizID: s.quizID,
+                title: s.quiz.title,
+                totalMarks: s.quiz.totalMarks,
+                obtainedMarks: s.marks || 0,
+                grade: s.grade || "",
+                feedback: s.feedback || "",
+                submittedAt: s.submittedAt || new Date()
+              }))
+            },
+            scheduledClasses: { // Fixed field name (was 'classes')
+              create: classAttendances.map(ca => ({
+                classID: ca.classID,
+                title: ca.class.title,
+                startTime: ca.class.startTime,
+                endTime: ca.class.endTime,
+                subjectID: ca.class.subjectID,
+                isPresent: ca.isPresent,
+                late: ca.late
+              }))
+            }
+          }
+        });
+      }
+
+      // 2. Cleanup Data from Source Classroom
+      await tx.attendanceRecord.deleteMany({
+        where: { studentID: { in: studentIds }, attendance: { entityId: sourceClassroom } }
+      });
+      await tx.assignmentSubmission.deleteMany({
+        where: { studentID: { in: studentIds }, assignment: { classroomID: sourceClassroom } }
+      });
+      await tx.quizSubmission.deleteMany({
+        where: { studentID: { in: studentIds }, quiz: { classroomID: sourceClassroom } }
+      });
+      await tx.classAttendance.deleteMany({
+        where: { studentID: { in: studentIds }, class: { classroomID: sourceClassroom } }
       });
 
-      // Get quizzes
-      const quizzes = await Quiz.find({ classroomID: sourceClassroom, "submissions.studentID": student.id });
-      const studentQuizzes = quizzes.map(qz => {
-        const sub = qz.submissions.find(s => s.studentID.toString() === student.id.toString());
-        return {
-          quizID: qz._id,
-          title: qz.title,
-          totalMarks: qz.totalMarks,
-          obtainedMarks: sub ? sub.marks : null,
-          grade: sub ? sub.grade : null,
-          feedback: sub ? sub.feedback : null,
-          submittedAt: sub ? sub.submittedAt : null,
-        };
+      // 3. Move Students between classrooms and update levels
+      await tx.classroom.update({
+        where: { id: sourceClassroom },
+        data: { students: { disconnect: studentIds.map(id => ({ id })) } }
+      });
+      await tx.classroom.update({
+        where: { id: targetClassroom },
+        data: { students: { connect: studentIds.map(id => ({ id })) } }
+      });
+      await tx.user.updateMany({
+        where: { id: { in: studentIds } },
+        data: { levelID: targetLevel }
       });
 
-      // Get Scheduled Classes and Attendance
-      const classes = await Class.find({ classroomID: sourceClassroom, "attendance.studentID": student.id });
-      const studentScheduleClasses = classes.map(cls => {
-        const att = cls.attendance.find(s => s.studentID.toString() === student.id.toString());
-        return {
-          classID: cls._id,
-          title: cls.title,
-          startTime: cls.startTime,
-          endTime: cls.endTime,
-          subjectID: cls.subjectID,
-          isPresent: att ? att.isPresent : false,
-          late: att ? att.late : false,
-        };
+      // 4. Save Promotion Record with PromotedStudent details
+      return await tx.studentPromote.create({
+        data: {
+          sourceClassroomID: sourceClassroom,
+          sourceLevelID: sourceLevel,
+          targetClassroomID: targetClassroom,
+          targetLevelID: targetLevel,
+          promotorName: currUser?.name || "Unknown",
+          promotorDate: new Date(),
+          promotorDescription,
+          isApproved: true,
+          students: {
+            create: students.map(s => ({
+              userID: s.id,
+              name: s.name,
+              rollNo: s.rollNo || ""
+            }))
+          }
+        }
       });
-
-      // Prepare archive document
-      archivedReports.push({
-        studentID: student.id,
-        sourceClassroomID: sourceClassroom,
-        targetClassroomID: targetClassroom,
-        promotionDate: new Date(),
-        attendanceRecords: studentAttendance,
-        assignments: studentAssignments,
-        quizzes: studentQuizzes,
-        scheduleClasses: studentScheduleClasses,
-      });
-    }
-
-    // Insert all archived reports
-    await ArchivedReport.insertMany(archivedReports);
-
-    // 2. Cleanup Data from Source Classroom (pull student from submissions/attendance)
-    await Attendance.updateMany(
-      { entityId: sourceClassroom, entityType: "classroom" },
-      { $pull: { students: { studentID: { $in: studentIds } } } }
-    );
-
-    await Assignment.updateMany(
-      { classroomID: sourceClassroom },
-      { $pull: { submissions: { studentID: { $in: studentIds } } } }
-    );
-
-    await Quiz.updateMany(
-      { classroomID: sourceClassroom },
-      { $pull: { submissions: { studentID: { $in: studentIds } } } }
-    );
-
-    await Class.updateMany(
-      { classroomID: sourceClassroom },
-      { $pull: { attendance: { studentID: { $in: studentIds } } } }
-    );
-
-    // 3. Move Students between classrooms
-    srcClassroom.students = srcClassroom.students.filter(id => !studentIds.includes(id.toString()));
-    await srcClassroom.save();
-
-    // Prevent duplicates in target classroom
-    const existingTargetStudents = tgtClassroom.students.map(id => id.toString());
-    const newStudentsToAdd = studentIds.filter(id => !existingTargetStudents.includes(id.toString()));
-    tgtClassroom.students.push(...newStudentsToAdd);
-    await tgtClassroom.save();
-
-    // Update the students' level details in the User collection
-    await User.updateMany({ _id: { $in: studentIds } }, { levelID: targetLevel });
-
-    // 4. Save Promotion Record
-    const newPromotion = new StudentPromote({
-      sourceClassroom,
-      sourceLevel,
-      targetClassroom,
-      targetLevel,
-      promotorName: currUser?.name || "Unknown",
-      promotorDate: new Date(),
-      promotorDescription,
-      isApproved: true, // Marking it approved directly
-      students
     });
 
-    const savedPromotion = await newPromotion.save();
-
-    res.status(201).json({ success: true, data: savedPromotion });
+    res.status(201).json({ success: true, data: result });
   } catch (error) {
     console.error('Error creating promotion:', error);
     res.status(500).json({ success: false, message: 'Server Error' });

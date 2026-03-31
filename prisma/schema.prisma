@@ -1,0 +1,552 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserType {
+  student
+  teacher
+  parent
+  admin
+  super_admin
+}
+
+enum Visibility {
+  parent
+  teacher
+  student
+  all
+}
+
+enum AnnouncementType {
+  annoouncement
+  quote
+}
+
+enum TeacherRole {
+  head
+  teacher
+}
+
+enum ChatType {
+  file
+  image
+  video
+  audio
+  text
+}
+
+enum AttendanceStatus {
+  present
+  absent
+  leave
+}
+
+model User {
+  id                  String   @id @default(uuid())
+  name                String
+  email               String   @unique
+  subjects            String[] @default([])
+  password            String
+  profilePic          String?
+  bio                 String?
+  createdAt           DateTime @default(now())
+  dob                 DateTime?
+  userType            UserType
+  phoneNumber         String?
+  levelID             String?
+  level               Level?   @relation(fields: [levelID], references: [id])
+  guardianId          String?
+  guardian            User?    @relation("GuardianToStudent", fields: [guardianId], references: [id])
+  students            User[]   @relation("GuardianToStudent")
+  guardianName        String?
+  guardianEmail       String?
+  guardianPhoneNumber String?
+  experience          String?
+  qualification       String?
+  cv                  String?
+  isBlocked           Boolean  @default(false)
+  feesPaid            Boolean  @default(true)
+  isAccepted          Boolean  @default(false)
+  rollNo              String?  @unique
+  referenceNo         String?  @unique
+  gender              String?
+  isFirstLogin        Boolean  @default(true)
+  
+  subscriptionActive  Boolean  @default(false)
+  subscriptionExpiresAt DateTime?
+
+  // Relations
+  activities             Activity[]
+  classroomsCreated      Classroom[]            @relation("ClassroomCreator")
+  classroomStudents      Classroom[]            @relation("ClassroomStudents")
+  classroomTeachers      ClassroomTeacher[]
+  assignmentsCreated     Assignment[]           @relation("AssignmentCreator")
+  quizzesCreated         Quiz[]                 @relation("QuizCreator")
+  assignmentSubmissions  AssignmentSubmission[]
+  quizSubmissions        QuizSubmission[]
+  notifications          Notification[]         @relation("NotificationUser")
+  notificationsDelivered Notification[]         @relation("NotificationDelivered")
+  notificationsRead      Notification[]         @relation("NotificationRead")
+  feedbacksSubmited      Feedback[]             @relation("FeedbackSubmitter")
+  feedbacksReceived      Feedback[]             @relation("FeedbackTarget")
+  devices                Device[]
+  sentChats              ChatMessage[]
+  chats                  Chat[]                 @relation("ChatParticipants")
+  chatRooms              ChatRoom[]             @relation("ChatRoomParticipants")
+  chatRoomMessages       ChatRoomMessage[]
+  lastChatRoomsMsgs      ChatRoom[]             @relation("ChatRoomLastMsg")
+  attendanceRecords      AttendanceRecord[]
+  classAttendance        ClassAttendance[]
+  classesTaught          Class[]                @relation("ClassTeacher")
+  classesCreated         Class[]                @relation("ClassCreator")
+  archivedReports        ArchivedReport[]
+
+  @@index([userType, guardianEmail])
+  @@index([userType, guardianPhoneNumber])
+  @@index([levelID])
+}
+
+model Level {
+  id               String           @id @default(uuid())
+  name             String           @unique
+  users            User[]
+  subjects         Subject[]
+  classrooms       Classroom[]
+  promotionsSource StudentPromote[] @relation("SourceLevel")
+  promotionsTarget StudentPromote[] @relation("TargetLevel")
+}
+
+model Subject {
+  id          String             @id @default(uuid())
+  name        String
+  levelID     String?
+  level       Level?             @relation(fields: [levelID], references: [id])
+  classrooms  ClassroomTeacher[]
+  assignments Assignment[]
+  quizzes     Quiz[]
+  classes     Class[]
+
+  @@unique([name, levelID])
+}
+
+model Activity {
+  id         String   @id @default(uuid())
+  userID     String
+  user       User     @relation(fields: [userID], references: [id])
+  loginTime  DateTime
+  logoutTime DateTime?
+  device     String
+  browser    String
+
+  @@index([userID, loginTime])
+}
+
+model Announcement {
+  id          String           @id @default(uuid())
+  title       String
+  description String
+  date        DateTime         @default(now())
+  type        AnnouncementType
+  visibility  Visibility
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  @@index([visibility])
+  @@index([date])
+}
+
+model Classroom {
+  id               String             @id @default(uuid())
+  name             String
+  levelID          String?
+  level            Level?             @relation(fields: [levelID], references: [id])
+  createdBy        String?
+  creator          User?              @relation("ClassroomCreator", fields: [createdBy], references: [id])
+  students         User[]             @relation("ClassroomStudents")
+  teachers         ClassroomTeacher[]
+  assignments      Assignment[]
+  quizzes          Quiz[]
+  classes          Class[]
+  attendance       Attendance[]
+  chatRooms        ChatRoom[]
+  promotionsSource StudentPromote[]   @relation("SourceClassroom")
+  promotionsTarget StudentPromote[]   @relation("TargetClassroom")
+  archivedSource   ArchivedReport[]   @relation("SourceClassroom")
+  archivedTarget   ArchivedReport[]   @relation("TargetClassroom")
+
+  @@unique([name, levelID])
+  @@index([levelID])
+}
+
+model ClassroomTeacher {
+  id          String      @id @default(uuid())
+  classroomID String
+  classroom   Classroom   @relation(fields: [classroomID], references: [id])
+  teacherID   String
+  teacher     User        @relation(fields: [teacherID], references: [id])
+  subjectID   String
+  subject     Subject     @relation(fields: [subjectID], references: [id])
+  type        TeacherRole @default(teacher)
+
+  @@index([teacherID])
+}
+
+model Assignment {
+  id          String                 @id @default(uuid())
+  title       String
+  text        String?
+  totalMarks  Int
+  dueDate     DateTime
+  createdBy   String
+  creator     User                   @relation("AssignmentCreator", fields: [createdBy], references: [id])
+  classroomID String
+  classroom   Classroom              @relation(fields: [classroomID], references: [id])
+  subjectID   String
+  subject     Subject                @relation(fields: [subjectID], references: [id])
+  createdAt   DateTime               @default(now())
+  updatedAt   DateTime               @updatedAt
+  files       File[]                 @relation("AssignmentFiles")
+  submissions AssignmentSubmission[]
+
+  @@index([classroomID, subjectID])
+  @@index([createdBy])
+  @@index([dueDate])
+}
+
+model Quiz {
+  id                 String           @id @default(uuid())
+  title              String
+  text               String?
+  totalMarks         Int
+  dueDate            DateTime
+  canSubmitAfterTime Boolean
+  createdBy          String
+  creator            User             @relation("QuizCreator", fields: [createdBy], references: [id])
+  classroomID        String
+  classroom          Classroom        @relation(fields: [classroomID], references: [id])
+  subjectID          String
+  subject            Subject          @relation(fields: [subjectID], references: [id])
+  createdAt          DateTime         @default(now())
+  files              File[]           @relation("QuizFiles")
+  submissions        QuizSubmission[]
+
+  @@index([classroomID, subjectID])
+  @@index([createdBy])
+  @@index([dueDate])
+}
+
+model File {
+  id           String      @id @default(uuid())
+  name         String
+  url          String
+  assignmentID String?
+  assignment   Assignment? @relation("AssignmentFiles", fields: [assignmentID], references: [id])
+  quizID       String?
+  quiz         Quiz?       @relation("QuizFiles", fields: [quizID], references: [id])
+}
+
+model AssignmentSubmission {
+  id           String     @id @default(uuid())
+  assignmentID String
+  assignment   Assignment @relation(fields: [assignmentID], references: [id])
+  studentID    String
+  student      User       @relation(fields: [studentID], references: [id])
+  feedback     String?
+  grade        String?
+  file         String?
+  marks        Int?
+  submittedAt  DateTime   @default(now())
+  isLate       Boolean?
+}
+
+model QuizSubmission {
+  id          String   @id @default(uuid())
+  quizID      String
+  quiz        Quiz     @relation(fields: [quizID], references: [id])
+  studentID   String
+  student     User     @relation(fields: [studentID], references: [id])
+  feedback    String?
+  grade       String?
+  file        String?
+  marks       Int?
+  submittedAt DateTime @default(now())
+  isLate      Boolean?
+}
+
+model Chat {
+  id           String        @id @default(uuid())
+  participants User[]        @relation("ChatParticipants")
+  messages     ChatMessage[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+}
+
+model ChatMessage {
+  id        String   @id @default(uuid())
+  chat      Chat     @relation(fields: [chatID], references: [id])
+  chatID    String
+  sentBy    User     @relation(fields: [senderID], references: [id])
+  senderID  String
+  message   String
+  type      ChatType @default(text)
+  time      DateTime @default(now())
+}
+
+model ChatRoom {
+  id           String            @id @default(uuid())
+  name         String?
+  participants User[]            @relation("ChatRoomParticipants")
+  classroomID  String?
+  classroom    Classroom?        @relation(fields: [classroomID], references: [id])
+  messages     ChatRoomMessage[]
+  lastMsgID    String?           @unique
+  lastMsg      User?             @relation("ChatRoomLastMsg", fields: [lastMsgSentBy], references: [id])
+  lastMsgSentBy String?
+  lastMsgTime  DateTime?
+  lastMsgType  String?
+  lastMsgText  String?
+
+  @@index([classroomID])
+}
+
+model ChatRoomMessage {
+  id         String   @id @default(uuid())
+  chatRoom   ChatRoom @relation(fields: [chatRoomID], references: [id])
+  chatRoomID String
+  sentBy     User     @relation(fields: [senderID], references: [id])
+  senderID   String
+  type       String
+  message    String
+  time       DateTime @default(now())
+}
+
+model Attendance {
+  id         String             @id @default(uuid())
+  entityId   String
+  classroom  Classroom          @relation(fields: [entityId], references: [id])
+  entityType String             @default("classroom")
+  date       DateTime           @default(now())
+  students   AttendanceRecord[]
+
+  @@unique([entityId, date])
+}
+
+model AttendanceRecord {
+  id           String     @id @default(uuid())
+  attendanceID String
+  attendance   Attendance @relation(fields: [attendanceID], references: [id])
+  studentID    String
+  student      User       @relation(fields: [studentID], references: [id])
+  isPresent    Boolean
+  late         Boolean    @default(false)
+
+  @@index([studentID])
+}
+
+model Class {
+  id              String            @id @default(uuid())
+  title           String
+  startTime       DateTime
+  endTime         DateTime
+  createdBy       String
+  creator         User              @relation("ClassCreator", fields: [createdBy], references: [id])
+  oneTime         Boolean
+  classroomID     String
+  classroom       Classroom         @relation(fields: [classroomID], references: [id])
+  subjectID       String
+  subject         Subject           @relation(fields: [subjectID], references: [id])
+  startEventDate  DateTime
+  endEventDate    DateTime
+  groupID         String?
+  teacherID       String?
+  teacher         User?             @relation("ClassTeacher", fields: [teacherID], references: [id])
+  teacherStatus   AttendanceStatus?
+  meetingUrl      String?
+  attendance      ClassAttendance[]
+
+  @@index([classroomID, startTime])
+  @@index([subjectID])
+  @@index([createdBy])
+  @@index([teacherID])
+}
+
+model ClassAttendance {
+  id        String  @id @default(uuid())
+  classID   String
+  class     Class   @relation(fields: [classID], references: [id])
+  studentID String
+  student   User    @relation(fields: [studentID], references: [id])
+  isPresent Boolean
+  late      Boolean @default(false)
+
+  @@index([studentID])
+}
+
+model Notification {
+  id            String   @id @default(uuid())
+  userID        String
+  user          User     @relation("NotificationUser", fields: [userID], references: [id])
+  message       String
+  url           String?
+  fileName      String?
+  fileUrl       String?
+  subjectName   String?
+  classroomName String?
+  createdAt     DateTime @default(now())
+  deliveredTo   User[]   @relation("NotificationDelivered")
+  readBy        User[]   @relation("NotificationRead")
+
+  @@index([userID, createdAt])
+}
+
+model Feedback {
+  id        String   @id @default(uuid())
+  userID    String
+  submitter User     @relation("FeedbackSubmitter", fields: [userID], references: [id])
+  message   String
+  createdAt DateTime @default(now())
+  accepted  Boolean  @default(false)
+  teacherID String
+  target    User     @relation("FeedbackTarget", fields: [teacherID], references: [id])
+
+  @@index([userID, createdAt])
+}
+
+model Device {
+  id       String @id @default(uuid())
+  userID   String
+  user     User   @relation(fields: [userID], references: [id])
+  fcmToken String @unique
+
+  @@index([userID])
+}
+
+model Settings {
+  id                   String   @id @default(uuid())
+  enableHeadAttendance Boolean  @default(false)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @default(now())
+
+  @@index([updatedAt])
+}
+
+model ArchivedReport {
+  id                String               @id @default(uuid())
+  studentID         String
+  student           User                 @relation(fields: [studentID], references: [id])
+  sourceClassroomID String
+  sourceClassroom   Classroom            @relation("SourceClassroom", fields: [sourceClassroomID], references: [id])
+  targetClassroomID String
+  targetClassroom   Classroom            @relation("TargetClassroom", fields: [targetClassroomID], references: [id])
+  promotionDate     DateTime             @default(now())
+  attendance        ArchivedAttendance[]
+  assignments       ArchivedAssignment[]
+  quizzes           ArchivedQuiz[]
+  scheduledClasses  ArchivedClass[]
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+
+  @@index([studentID])
+  @@index([sourceClassroomID])
+}
+
+model ArchivedAttendance {
+  id               String         @id @default(uuid())
+  archivedReportID String
+  report           ArchivedReport @relation(fields: [archivedReportID], references: [id])
+  date             DateTime
+  isPresent        Boolean
+  late             Boolean
+}
+
+model ArchivedAssignment {
+  id               String         @id @default(uuid())
+  archivedReportID String
+  report           ArchivedReport @relation(fields: [archivedReportID], references: [id])
+  assignmentID     String?
+  title            String
+  totalMarks       Int
+  obtainedMarks    Int
+  grade            String?
+  feedback         String?
+  submittedAt      DateTime?
+}
+
+model ArchivedQuiz {
+  id               String         @id @default(uuid())
+  archivedReportID String
+  report           ArchivedReport @relation(fields: [archivedReportID], references: [id])
+  quizID           String?
+  title            String
+  totalMarks       Int
+  obtainedMarks    Int
+  grade            String?
+  feedback         String?
+  submittedAt      DateTime?
+}
+
+model ArchivedClass {
+  id               String         @id @default(uuid())
+  archivedReportID String
+  report           ArchivedReport @relation(fields: [archivedReportID], references: [id])
+  classID          String?
+  title            String
+  startTime        DateTime
+  endTime          DateTime
+  subjectID        String?
+  isPresent        Boolean
+  late             Boolean
+}
+
+model StudentPromote {
+  id                  String             @id @default(uuid())
+  sourceClassroomID   String
+  sourceClassroom     Classroom          @relation("SourceClassroom", fields: [sourceClassroomID], references: [id])
+  sourceLevelID       String
+  sourceLevel         Level              @relation("SourceLevel", fields: [sourceLevelID], references: [id])
+  targetClassroomID   String
+  targetClassroom     Classroom          @relation("TargetClassroom", fields: [targetClassroomID], references: [id])
+  targetLevelID       String
+  targetLevel         Level              @relation("TargetLevel", fields: [targetLevelID], references: [id])
+  promotorName        String
+  promotorDate        DateTime           @default(now())
+  promotorDescription String?
+  approvalName        String?
+  approvalDescription String?
+  approvalDate        DateTime?
+  isApproved          Boolean            @default(false)
+  students            PromotedStudent[]
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+
+  @@index([sourceClassroomID, sourceLevelID])
+  @@index([targetClassroomID, targetLevelID])
+  @@index([promotorDate])
+}
+
+model PromotedStudent {
+  id               String         @id @default(uuid())
+  studentPromoteID String
+  promotion        StudentPromote @relation(fields: [studentPromoteID], references: [id])
+  userID           String
+  name             String
+  rollNo           String
+
+  @@index([userID])
+}
+
+
+model SystemSetting {
+  id                   String   @id @default(uuid())
+  enableHeadAttendance Boolean  @default(false)
+  updatedAt            DateTime @updatedAt
+  createdAt            DateTime @default(now())
+}

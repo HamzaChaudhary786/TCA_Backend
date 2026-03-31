@@ -1,74 +1,64 @@
-
-const Setting = require("../models/settingsModel");
+const prisma = require("../db/prisma");
 
 exports.addHeadAttendanceSetting = async (req, res, next) => {
     try {
         const { enableHeadAttendance } = req.body;
 
-        // Create a new attendance setting
-        const newSetting = new Setting({
-            attendenceSetting: {
-                enableHeadAttendance: enableHeadAttendance, // Set the initial value
-            },
-        });
+        // Check if setting already exists (we usually only want one setting record)
+        let setting = await prisma.systemSetting.findFirst();
 
-        // Save the setting to the database
-        const savedSetting = await newSetting.save();
+        if (setting) {
+            setting = await prisma.systemSetting.update({
+                where: { id: setting.id },
+                data: { enableHeadAttendance: enableHeadAttendance }
+            });
+        } else {
+            setting = await prisma.systemSetting.create({
+                data: { enableHeadAttendance: enableHeadAttendance }
+            });
+        }
 
-        res.status(201).json(savedSetting); // Respond with the created setting
+        res.status(201).json(setting); 
     } catch (err) {
-        next(err); // Pass error to middleware
+        next(err); 
     }
 };
-
-
 
 exports.updateHeadAttendanceSetting = async (req, res, next) => {
     try {
         const { settingId, enableHeadAttendance } = req.body;
 
-        // Find the setting by ID and update it
-        const updatedSetting = await Setting.findByIdAndUpdate(
-            settingId,
-            {
-                $set: {
-                    "attendenceSetting.enableHeadAttendance": enableHeadAttendance, // Update nested field
-                    updatedAt: Date.now(),
-                },
-            },
-            { new: true } // Return the updated document
-        );
+        const updatedSetting = await prisma.systemSetting.update({
+            where: { id: settingId },
+            data: { enableHeadAttendance: enableHeadAttendance }
+        });
 
-        if (!updatedSetting) {
+        res.status(200).json(updatedSetting);
+    } catch (err) {
+        if (err.code === "P2025") { // Prisma not found error
             return res.status(404).json({ message: "Setting not found" });
         }
-
-        res.status(200).json(updatedSetting); // Respond with updated setting
-    } catch (err) {
-        next(err); // Pass error to middleware
+        next(err);
     }
 };
 
 exports.getSettings = async (req, res, next) => {
     try {
-        console.log("run inside function");
+        const setting = await prisma.systemSetting.findFirst(); 
 
-        // Use the compiled model
-        const setting = await Setting.findOne(); // Fetch first document
-
-        console.log(setting, "setting");
-
-
-        // Check if no data is found
         if (!setting) {
             return res.status(404).json({ message: "Setting not found" });
         }
 
-        // Return the setting object
-        res.status(200).json(setting);
+        res.status(200).json({
+            id: setting.id,
+            attendenceSetting: {
+                enableHeadAttendance: setting.enableHeadAttendance
+            },
+            createdAt: setting.createdAt,
+            updatedAt: setting.updatedAt
+        });
     } catch (err) {
-        next(err); // Pass error to middleware
+        next(err); 
     }
 };
-
-

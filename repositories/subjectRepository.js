@@ -1,13 +1,13 @@
-
-
-const Subject = require('../models/subject');
+const prisma = require('../db/prisma');
 
 
 class SubjectRepository {
 
 
     async findSubjectById(subjectId) {
-        return await Subject.findById(subjectId);
+        return await prisma.subject.findUnique({
+            where: { id: subjectId }
+        });
     }
 }
 

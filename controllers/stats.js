@@ -1,4 +1,4 @@
-const User = require("../models/user");
+const prisma = require("../db/prisma");
 const moment = require("moment");
 
 exports.getSystemOverviewStats = async (req, res, next) => {
@@ -6,49 +6,38 @@ exports.getSystemOverviewStats = async (req, res, next) => {
         // Last 12 months including current month
         const startOfPeriod = moment().subtract(11, "months").startOf("month");
 
-        const aggregation = await User.aggregate([
-            {
-                $match: {
-                    createdAt: { $gte: startOfPeriod.toDate() },
-                    userType: { $in: ["student", "teacher", "parent"] },
-                },
+        const users = await prisma.user.findMany({
+            where: {
+                createdAt: { gte: startOfPeriod.toDate() },
+                userType: { in: ["student", "teacher", "parent"] }
             },
-            {
-                $group: {
-                    _id: {
-                        month: { $month: "$createdAt" },
-                        year: { $year: "$createdAt" },
-                        userType: "$userType",
-                    },
-                    count: { $sum: 1 },
-                },
-            },
-        ]);
+            select: { createdAt: true, userType: true }
+        });
 
         // Initialize the last 12 months with 0 counts
-        const months = [];
-        for (let i = 0; i < 12; i++) {
+        const months = Array.from({ length: 12 }, (_, i) => {
             const date = moment().subtract(11 - i, "months");
-            months.push({
+            return {
                 name: date.format("MMM"),
-                fullDate: date.format("YYYY-MM"),
-                monthIndex: date.month() + 1, // $month is 1-indexed
+                monthIndex: date.month() + 1,
                 year: date.year(),
                 Students: 0,
                 Teachers: 0,
                 Parents: 0,
-            });
-        }
+            };
+        });
 
-        // Fill in the counts from aggregation
-        aggregation.forEach((item) => {
-            const monthData = months.find(
-                (m) => m.monthIndex === item._id.month && m.year === item._id.year
-            );
+        // Fill in the counts from memory
+        users.forEach((user) => {
+            const date = moment(user.createdAt);
+            const mIndex = date.month() + 1;
+            const mYear = date.year();
+            
+            const monthData = months.find(m => m.monthIndex === mIndex && m.year === mYear);
             if (monthData) {
-                if (item._id.userType === "student") monthData.Students = item.count;
-                else if (item._id.userType === "teacher") monthData.Teachers = item.count;
-                else if (item._id.userType === "parent") monthData.Parents = item.count;
+                if (user.userType === "student") monthData.Students++;
+                else if (user.userType === "teacher") monthData.Teachers++;
+                else if (user.userType === "parent") monthData.Parents++;
             }
         });
 

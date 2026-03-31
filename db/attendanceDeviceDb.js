@@ -1,12 +1,7 @@
 const sql = require('mssql');
 const moment = require('moment');
-const mongoose = require('mongoose');
+const prisma = require('../db/prisma');
 require('dotenv').config();
-
-// Import Models with correct paths
-const User = require('../models/user.js');
-const Classroom = require('../models/classroom.js');
-const Attendance = require('../models/attendence.js');
 
 // Import socket from your existing socket setup
 const { io } = require('../utils/socket');
@@ -103,7 +98,7 @@ async function processAttendanceData() {
         }
 
         // Step 2: Get all classrooms with students
-        const classrooms = await Classroom.find().populate('students');
+        const classrooms = await prisma.classroom.findMany({ include: { students: true } });
 
         if (!classrooms || classrooms.length === 0) {
             console.log("No classrooms found");
@@ -122,7 +117,7 @@ async function processAttendanceData() {
 
                 if (student) {
                     // Step 5: Found student in this classroom, now save attendance
-                    const saved = await saveStudentAttendance(classroom._id, student._id, rollNO);
+                    const saved = await saveStudentAttendance(classroom.id, student.id, rollNO);
                     if (saved) processedCount++;
                     break; // Student found, no need to check other classrooms
                 }
@@ -152,35 +147,42 @@ async function saveStudentAttendance(classroomId, studentId, rollNo) {
         const today = moment().startOf('day').toDate();
 
         // Check if attendance already exists for this classroom today
-        let attendance = await Attendance.findOne({
-            entityId: classroomId,
-            entityType: "classroom",
-            Date: {
-                $gte: today,
-                $lt: moment(today).endOf('day').toDate()
-            }
+        let attendance = await prisma.attendance.findFirst({
+            where: {
+                entityId: classroomId,
+                entityType: "classroom",
+                date: {
+                    gte: today,
+                    lt: moment(today).endOf('day').toDate()
+                }
+            },
+            include: { students: true }
         });
 
         if (attendance) {
             // Check if student already marked present
             const existingStudent = attendance.students.find(s =>
-                s.studentID.toString() === studentId.toString()
+                s.studentID === studentId
             );
 
             if (!existingStudent) {
                 // Add student to existing attendance record
-                attendance.students.push({
-                    studentID: studentId,
-                    isPresent: true,
-                    late: false
+                await prisma.attendanceRecord.create({
+                    data: {
+                        attendanceID: attendance.id,
+                        studentID: studentId,
+                        isPresent: true,
+                        late: false
+                    }
                 });
-                await attendance.save();
                 console.log(`Added student ${rollNo} to existing attendance`);
                 return true;
             } else if (!existingStudent.isPresent) {
                 // Update existing student record to present
-                existingStudent.isPresent = true;
-                await attendance.save();
+                await prisma.attendanceRecord.update({
+                    where: { id: existingStudent.id },
+                    data: { isPresent: true }
+                });
                 console.log(`Updated student ${rollNo} attendance to present`);
                 return true;
             }
@@ -188,17 +190,20 @@ async function saveStudentAttendance(classroomId, studentId, rollNo) {
             return false;
         } else {
             // Create new attendance record for this classroom
-            attendance = new Attendance({
-                entityId: classroomId,
-                entityType: "classroom",
-                Date: today,
-                students: [{
-                    studentID: studentId,
-                    isPresent: true,
-                    late: false
-                }]
+            await prisma.attendance.create({
+                data: {
+                    entityId: classroomId,
+                    entityType: "classroom",
+                    date: today,
+                    students: {
+                        create: [{
+                            studentID: studentId,
+                            isPresent: true,
+                            late: false
+                        }]
+                    }
+                }
             });
-            await attendance.save();
             console.log(`Created new attendance record for student ${rollNo}`);
             return true;
         }

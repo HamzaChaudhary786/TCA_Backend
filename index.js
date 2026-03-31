@@ -14,12 +14,12 @@ const session = require("express-session");
 const cors = require("cors");
 const passport = require("passport"); // authentication
 const { initializingPassport } = require("./passportConfig");
-const MongoStore = require("connect-mongo");
+const pgSession = require("connect-pg-simple")(session);
 const rateLimit = require("express-rate-limit");
 
 const userRouter = require("./routes/user");
 
-const mongoose = require("mongoose");
+const prisma = require("./db/prisma");
 
 var debug = require("debug")("tyre-project:server");
 var http = require("http");
@@ -41,8 +41,6 @@ const { checkLoggedIn } = require("./middlewares/checkLoggedIn");
 const { checkSubscription } = require("./middlewares/checkSubscription");
 const authRouter = require("./routes/auth");
 const settingsRouter = require("./routes/settingsRouter")
-const Level = require("./models/level");
-const User = require("./models/user");
 const { initializeAttendanceProcessing } = require("./db/attendanceDeviceDb");
 
 
@@ -70,8 +68,9 @@ app.use(
     name: "finSess",
     secret: process.env.TOKEN_SECRET || "IAMCASTUDENT",
     resave: false,
-    store: MongoStore.create({
-      mongoUrl: process.env.MONGO_CONNECTION,
+    store: new pgSession({
+      conString: process.env.DATABASE_URL,
+      tableName: 'session'
     }),
     saveUninitialized: true,
     cookie: isProduction
@@ -83,7 +82,6 @@ app.use(
       : {
         sameSite: "lax", // "none" for cross-origin, "lax" for development
         httpOnly: true, // Prevent JavaScript access to cookies
-
       },
   })
 );
@@ -113,6 +111,7 @@ app.use("/api/notification/", checkLoggedIn, notificationRouter);
 app.use("/api/announcement/", checkLoggedIn, announcementRouter);
 app.use("/api/parent", require("./routes/parent"));
 app.use("/api/upload/", require("./routes/uploadCSVFile"));
+app.use("/api/media/", checkLoggedIn, require("./routes/upload"));
 app.use("/api/chatroom/", checkLoggedIn, require("./routes/chatroom"));
 app.use("/webhook", require("./routes/whatsapp/whatsapp"));
 app.use("/api/admin/", checkLoggedIn, promoteRouter);
@@ -214,19 +213,16 @@ app.use(function (err, req, res, next) {
 
 
 
-const db = process.env.MONGO_CONNECTION;
-mongoose.connect(
-  db,
-  { useNewUrlParser: true, useUnifiedTopology: true, useFindAndModify: true },
-  (err) => {
-    if (err) {
-      console.log(err);
-    } else {
-      initializeAttendanceProcessing();
-      console.log("Connected to MongoDB");
-    }
-  }
-);
+// Database connection is handled by Prisma internally, 
+// but we ensure it's healthy here.
+prisma.$connect()
+  .then(() => {
+    initializeAttendanceProcessing();
+    console.log("Connected to PostgreSQL via Prisma");
+  })
+  .catch((err) => {
+    console.error("Failed to connect to PostgreSQL:", err);
+  });
 var port = process.env.PORT || (isProduction ? 443 : 4000);
 const sslKeyPath = process.env.SSL_KEY_PATH;
 const sslCertPath = process.env.SSL_CERT_PATH;

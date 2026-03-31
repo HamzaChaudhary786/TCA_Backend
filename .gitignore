@@ -42,3 +42,5 @@ config/*firebase-adminsdk*.json
 
 # Env
 .env
+
+/generated/prisma

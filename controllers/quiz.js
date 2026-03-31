@@ -1,96 +1,65 @@
-const mongoose = require("mongoose");
-const Classroom = require("../models/classroom");
-const Quiz = require("../models/quiz");
-const Notification = require("../models/notification");
-const User = require("../models/user");
-const Subject = require("../models/subject");
-
-
+const prisma = require("../db/prisma");
 
 exports.createQuiz = async (req, res, next) => {
-  const {
-    title,
-    text,
-    totalMarks,
-    dueDate,
-    files,
-    canSubmitAfterTime,
-    classroomID,
-    subjectID,
-  } = req.body;
-  const createdBy = req.user._id;
+  const { title, text, totalMarks, dueDate, files, canSubmitAfterTime, classroomID, subjectID } = req.body;
+  const createdBy = req.user.id;
   try {
-    //check if classroom exists and teacher is part of that classroom
-    const classroom = await Classroom.findById(classroomID);
-    if (!classroom) {
-      return res.status(404).json({ message: "Classroom not found" });
-    }
-
-    if (new Date() > new Date(dueDate)) {
-      return res
-        .status(400)
-        .json({ message: "Due date should be greater than current date" });
-    }
-
-    const isTeacher = classroom.teachers.find(
-      (tea) => tea.teacher.toString() == req.user._id.toString()
-    );
-    if (!isTeacher) {
-      return res.status(403).json({ message: "You are not a teacher in this classroom" });
-    }
-
-    const quiz = new Quiz({
-      title,
-      text,
-      totalMarks,
-      dueDate,
-      files,
-      canSubmitAfterTime,
-      createdBy,
-      classroomID,
-      subjectID,
+    const classroom = await prisma.classroom.findUnique({
+      where: { id: classroomID },
+      include: { teachers: true, students: true }
     });
-    await quiz.save();
+    if (!classroom) return res.status(404).json({ message: "Classroom not found" });
 
-    // Create notifications for students and parents
-    const students = await User.find({ _id: { $in: classroom.students } });
-    const studentIds = students.map((s) => s._id);
+    if (new Date() > new Date(dueDate)) return res.status(400).json({ message: "Due date should be greater than current date" });
 
-    // Collect all unique guardian emails and IDs
-    const guardianIds = new Set();
-    const guardianEmails = new Set();
+    const isTeacher = classroom.teachers.find(tea => tea.teacherID === createdBy);
+    if (!isTeacher) return res.status(403).json({ message: "You are not a teacher in this classroom" });
 
-    students.forEach(s => {
-      if (s.guardianId) guardianIds.add(s.guardianId.toString());
-      if (s.guardianEmail) guardianEmails.add(s.guardianEmail);
+    const quiz = await prisma.quiz.create({
+      data: {
+        title,
+        text,
+        totalMarks: parseInt(totalMarks) || 0,
+        dueDate: new Date(dueDate),
+        canSubmitAfterTime: canSubmitAfterTime === 'true' || canSubmitAfterTime === true,
+        createdBy,
+        classroomID,
+        subjectID,
+        files: {
+          create: (files || []).map(f => ({
+            name: typeof f === 'string' ? f.split('/').pop() : f.name,
+            url: typeof f === 'string' ? f : f.url
+          }))
+        }
+      }
     });
 
-    // Find parent users who match the emails if they aren't already in the IDs set
-    if (guardianEmails.size > 0) {
-      const parentUsers = await User.find({ email: { $in: Array.from(guardianEmails) }, userType: "parent" });
-      parentUsers.forEach(p => guardianIds.add(p._id.toString()));
-    }
-
-    const parentIdsArray = Array.from(guardianIds).map(id => mongoose.Types.ObjectId(id));
-    const subject = await Subject.findById(subjectID);
+    // Notifications
+    const studentIds = classroom.students.map(s => s.id);
+    const guardianIds = classroom.students.map(s => s.guardianId).filter(Boolean);
+    const subject = await prisma.subject.findUnique({ where: { id: subjectID } });
 
     if (studentIds.length > 0) {
-      await Notification.create({
-        userID: createdBy,
-        deliveredTo: studentIds,
-        message: `New quiz created: ${title}`,
-        subjectName: subject ? subject.name : "Subject",
-        classroomName: classroom.name,
+      await prisma.notification.create({
+        data: {
+          userID: createdBy,
+          message: `New quiz created: ${title}`,
+          subjectName: subject ? subject.name : "Subject",
+          classroomName: classroom.name,
+          deliveredTo: { connect: studentIds.map(id => ({ id })) }
+        }
       });
     }
 
-    if (parentIdsArray.length > 0) {
-      await Notification.create({
-        userID: createdBy,
-        deliveredTo: parentIdsArray,
-        message: `New quiz created for your child: ${title}`,
-        subjectName: subject ? subject.name : "Subject",
-        classroomName: classroom.name,
+    if (guardianIds.length > 0) {
+      await prisma.notification.create({
+        data: {
+          userID: createdBy,
+          message: `New quiz created for your child: ${title}`,
+          subjectName: subject ? subject.name : "Subject",
+          classroomName: classroom.name,
+          deliveredTo: { connect: guardianIds.map(id => ({ id })) }
+        }
       });
     }
 
@@ -103,36 +72,32 @@ exports.createQuiz = async (req, res, next) => {
 exports.editQuiz = async (req, res, next) => {
   const { title, text, totalMarks, subjectID, dueDate, files, canSubmitAfterTime } = req.body;
   const { id } = req.params;
-
   try {
-    if (dueDate) {
-      if (new Date() > new Date(dueDate)) {
-        return res
-          .status(400)
-          .json({ message: "Due date should be greater than current date" });
+    if (dueDate && new Date() > new Date(dueDate)) return res.status(400).json({ message: "Due date should be greater than current date" });
+
+    const quiz = await prisma.quiz.findUnique({ where: { id } });
+    if (!quiz) return res.status(404).json({ message: "Quiz not found" });
+    if (quiz.createdBy !== req.user.id) return res.status(403).json({ message: "Unauthorized to edit this quiz" });
+
+    const updated = await prisma.quiz.update({
+      where: { id },
+      data: {
+        title: title || undefined,
+        text: text || undefined,
+        totalMarks: (totalMarks !== undefined && totalMarks !== "") ? (parseInt(totalMarks) || 0) : undefined,
+        subjectID: subjectID || undefined,
+        dueDate: dueDate ? new Date(dueDate) : undefined,
+        canSubmitAfterTime: canSubmitAfterTime !== undefined ? (canSubmitAfterTime === 'true' || canSubmitAfterTime === true) : undefined,
+        files: files ? {
+          deleteMany: {},
+          create: files.map(f => ({
+            name: typeof f === 'string' ? f.split('/').pop() : f.name,
+            url: typeof f === 'string' ? f : f.url
+          }))
+        } : undefined
       }
-    }
-
-    // check if quiz exists and teacher who created quiz is editing it
-    const quiz = await Quiz.findById(id);
-    if (!quiz) {
-      return res.status(404).json({ message: "Quiz not found" });
-    }
-    if (quiz.createdBy.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: "Unauthorized to edit this quiz" });
-    }
-
-    quiz.title = title ? title : quiz.title;
-    quiz.text = text ? text : quiz.text;
-    quiz.totalMarks = totalMarks ? totalMarks : quiz.totalMarks;
-    quiz.subjectID = subjectID ? subjectID : quiz.subjectID;
-    quiz.dueDate = dueDate ? dueDate : quiz.dueDate;
-    quiz.files = files ? files : quiz.files;
-    quiz.canSubmitAfterTime = canSubmitAfterTime
-      ? canSubmitAfterTime
-      : quiz.canSubmitAfterTime;
-    await quiz.save();
-    res.status(200).send(quiz);
+    });
+    res.status(200).send(updated);
   } catch (error) {
     next(error);
   }
@@ -141,16 +106,16 @@ exports.editQuiz = async (req, res, next) => {
 exports.deleteQuiz = async (req, res, next) => {
   const { id } = req.params;
   try {
-    // check if quiz exists and teacher who created quiz is deleting it
+    const quiz = await prisma.quiz.findUnique({ where: { id } });
+    if (!quiz) return res.status(404).send();
+    if (quiz.createdBy !== req.user.id) return res.status(403).send();
 
-    const quiz = await Quiz.findById(id);
-    if (!quiz) {
-      return res.status(404).send();
-    }
-    if (quiz.createdBy.toString() !== req.user._id.toString()) {
-      return res.status(403).send();
-    }
-    await quiz.remove();
+    await prisma.$transaction([
+      prisma.file.deleteMany({ where: { quizID: id } }),
+      prisma.quizSubmission.deleteMany({ where: { quizID: id } }),
+      prisma.quiz.delete({ where: { id } })
+    ]);
+
     res.send(quiz);
   } catch (error) {
     next(error);
@@ -160,139 +125,81 @@ exports.deleteQuiz = async (req, res, next) => {
 exports.submitQuiz = async (req, res, next) => {
   const { id } = req.params;
   const { file } = req.body;
+  const studentID = req.user.id;
   try {
-    //check if quiz exists and student is part of that classroom
+    const quiz = await prisma.quiz.findUnique({
+      where: { id },
+      include: { subject: true, classroom: true }
+    });
+    if (!quiz) return res.status(404).send();
 
-    const quiz = await Quiz.findById(id);
-    if (!quiz) {
-      return res.status(404).send();
-    }
-    const classroom = await Classroom.findById(quiz.classroomID);
-    if (!classroom) {
-      return res.status(404).send();
-    }
-    const isStudent = classroom.students.find(
-      (stu) => stu.toString() == req.user._id.toString()
-    );
-    if (!isStudent) {
-      return res.status(403).send();
-    }
+    if (!quiz.canSubmitAfterTime && new Date() > quiz.dueDate) return res.status(403).send("Can't submit after due date");
 
-    //check if quiz is still open for submission
-    if (!quiz.canSubmitAfterTime) {
-      const now = new Date();
-      if (now > quiz.dueDate) {
-        return res.status(403).send("Can't submit after due date");
-      }
-    }
+    const isStudent = await prisma.classroom.findFirst({
+        where: { id: quiz.classroomID, students: { some: { id: studentID } } }
+    });
+    if (!isStudent) return res.status(403).send();
 
-    //check if already submitted
-    const isSubmitted = quiz.submissions.find(
-      (sub) => sub.studentID.toString() == req.user._id.toString()
-    );
-    if (isSubmitted) {
-      return res.status(403).send("Already submitted");
-    }
+    const alreadySubmitted = await prisma.quizSubmission.findFirst({
+        where: { quizID: id, studentID }
+    });
+    if (alreadySubmitted) return res.status(403).send("Already submitted");
 
-    const submission = {
-      studentID: req.user._id,
-      file,
-      isLate: new Date() > quiz.dueDate,
-    };
-    quiz.submissions.push(submission);
-    await quiz.save();
-
-    // Create notifications for teacher and parent
-    let recipients = [quiz.createdBy];
-    if (req.user.guardianId) {
-      recipients.push(req.user.guardianId);
-    } else if (req.user.guardianEmail) {
-      const parent = await User.findOne({ email: req.user.guardianEmail, userType: "parent" });
-      if (parent) recipients.push(parent._id);
-    }
-
-    const populatedQuiz = await Quiz.findById(id).populate("subjectID classroomID");
-    await Notification.create({
-      userID: req.user._id,
-      deliveredTo: recipients,
-      message: `${req.user.name} submitted a quiz`,
-      subjectName: populatedQuiz.subjectID.name,
-      classroomName: populatedQuiz.classroomID.name,
-      file: {
-        name: file.split("/").pop() || "quiz",
-        url: file
+    const submission = await prisma.quizSubmission.create({
+      data: {
+        quizID: id,
+        studentID,
+        file,
+        isLate: new Date() > quiz.dueDate
       }
     });
 
-    res.status(201).send(quiz);
+    // Notifications
+    const student = req.user;
+    const recipients = [quiz.createdBy, student.guardianId].filter(Boolean);
+
+    await prisma.notification.create({
+      data: {
+        userID: studentID,
+        message: `${student.name} submitted a quiz`,
+        subjectName: quiz.subject.name,
+        classroomName: quiz.classroom.name,
+        deliveredTo: { connect: recipients.map(rid => ({ id: rid })) }
+      }
+    });
+
+    res.status(201).send(submission);
   } catch (error) {
     next(error);
   }
 };
 
 exports.gradeQuizes = async (req, res, next) => {
-  //grade multiple quizes
   const { id } = req.params;
   const { submissions } = req.body;
   try {
-    const quiz = await Quiz.findById(id);
-    if (!quiz) {
-      return res.status(404).send();
+    const quiz = await prisma.quiz.findUnique({ where: { id } });
+    if (!quiz) return res.status(404).send();
+    if (quiz.createdBy !== req.user.id) return res.status(403).send();
+
+    const invalidMarks = submissions.find(s => s.marks > quiz.totalMarks);
+    if (invalidMarks) return res.status(400).send("Invalid marks");
+
+    for (const s of submissions) {
+        const existing = await prisma.quizSubmission.findFirst({ where: { quizID: id, studentID: s.studentID } });
+        if (existing) {
+            await prisma.quizSubmission.update({ 
+                where: { id: existing.id }, 
+                data: { feedback: s.feedback || "", grade: s.grade || "", marks: s.marks ? parseInt(s.marks) : 0 } 
+            });
+        } else {
+            await prisma.quizSubmission.create({ 
+                data: { quizID: id, studentID: s.studentID, feedback: s.feedback || "", grade: s.grade || "", marks: s.marks ? parseInt(s.marks) : 0 } 
+            });
+        }
     }
 
-    //check if submissions has marks greater than total marks
-    const invalidMarks = submissions.find((s) => s.marks > quiz.totalMarks);
-    if (invalidMarks) {
-      return res.status(400).send("Invalid marks");
-    }
-
-    // check if teacher who created quiz is grading it
-    if (quiz.createdBy.toString() !== req.user._id.toString()) {
-      return res.status(403).send();
-    }
-
-    // find submission in quiz and update only marks, feedback and grade
-    // const updatedSubmissions = quiz.submissions.map((submission) => {
-    //   const newSubmission = submissions.find(
-    //     (s) => s.studentID.toString() == submission.studentID.toString()
-    //   );
-
-    //   if (newSubmission) {
-    //     submission.marks = newSubmission.marks;
-    //     submission.feedback = newSubmission.feedback
-    //       ? newSubmission.feedback
-    //       : "";
-    //     submission.grade = "A";
-    //   }
-    //   return submission;
-    // });
-
-    // quiz.submissions = updatedSubmissions;
-
-    // Update submissions: support students who haven't submitted yet
-    submissions.forEach((updatedSubmission) => {
-      const existingSubmission = quiz.submissions.find(
-        (s) => s.studentID.toString() === updatedSubmission.studentID.toString()
-      );
-
-      if (existingSubmission) {
-        // Update existing submission
-        existingSubmission.feedback = updatedSubmission.feedback !== undefined ? updatedSubmission.feedback : existingSubmission.feedback;
-        existingSubmission.grade = updatedSubmission.grade !== undefined ? updatedSubmission.grade : existingSubmission.grade;
-        existingSubmission.marks = updatedSubmission.marks !== undefined ? updatedSubmission.marks : existingSubmission.marks;
-      } else {
-        // Create new entry for students who haven't submitted
-        quiz.submissions.push({
-          studentID: updatedSubmission.studentID,
-          feedback: updatedSubmission.feedback || "",
-          grade: updatedSubmission.grade || "",
-          marks: updatedSubmission.marks !== undefined ? updatedSubmission.marks : 0,
-        });
-      }
-    });
-
-    await quiz.save();
-    res.send(quiz);
+    res.send({ message: "Graded successfully" });
   } catch (error) {
     next(error);
   }
@@ -301,8 +208,8 @@ exports.gradeQuizes = async (req, res, next) => {
 exports.getQuizesOfClassroom = async (req, res, next) => {
   const { classroomID } = req.params;
   try {
-    const quiz = await Quiz.find({ classroomID });
-    res.send(quiz);
+    const quizzes = await prisma.quiz.findMany({ where: { classroomID } });
+    res.send(quizzes);
   } catch (error) {
     next(error);
   }
@@ -310,9 +217,9 @@ exports.getQuizesOfClassroom = async (req, res, next) => {
 
 exports.getQuizesOfClassroomOfTeacher = async (req, res, next) => {
   const { classroomID } = req.params;
-  const createdBy = req.user._id;
+  const createdBy = req.user.id;
   try {
-    const quizes = await Quiz.find({ classroomID, createdBy });
+    const quizes = await prisma.quiz.findMany({ where: { classroomID, createdBy } });
     res.send(quizes);
   } catch (error) {
     next(error);
@@ -320,47 +227,31 @@ exports.getQuizesOfClassroomOfTeacher = async (req, res, next) => {
 };
 
 exports.getAllQuizesOfTeacher = async (req, res, next) => {
-  const createdBy = req.user._id;
-
+  const createdBy = req.user.id;
   try {
-    const quizes = await Quiz.find({ createdBy })
-      .populate({
-        path: "createdBy",
-        select: "name email", // Teacher info
-        model: "User",
-      })
-      .populate({
-        path: "subjectID",
-        select: "name", // Subject name
-        model: "Subject",
-      })
-      .populate({
-        path: "classroomID",
-        model: "Classroom",
-        populate: [
-          {
-            path: "students",
-            select: "name email levelID subjects",
-            model: "User",
-          },
-          {
-            path: "teachers.teacher",
-            select: "name email",
-            model: "User",
-          },
-          {
-            path: "teachers.subject",
-            select: "name",
-            model: "Subject",
-          },
-          {
-            path: "levelID",
-            model: "Level",
+    const quizes = await prisma.quiz.findMany({
+      where: { createdBy },
+      include: {
+        creator: true,
+        subject: true,
+        submissions: true,
+        classroom: {
+          include: {
+            students: true,
+            teachers: { include: { teacher: true, subject: true } },
           }
-        ],
-      });
+        }
+      }
+    });
 
-    res.send(quizes);
+    const result = quizes.map(q => ({
+        ...q,
+        classroomID: q.classroom,
+        subjectID: q.subject,
+        creator: q.creator
+    }));
+
+    res.send(result);
   } catch (error) {
     next(error);
   }
@@ -370,10 +261,8 @@ exports.getAllQuizesOfTeacher = async (req, res, next) => {
 exports.getQuizById = async (req, res, next) => {
   const { id } = req.params;
   try {
-    const quiz = await Quiz.findById(id);
-    if (!quiz) {
-      return res.status(404).send();
-    }
+    const quiz = await prisma.quiz.findUnique({ where: { id } });
+    if (!quiz) return res.status(404).send();
     res.send(quiz);
   } catch (error) {
     next(error);
@@ -382,18 +271,15 @@ exports.getQuizById = async (req, res, next) => {
 
 exports.getStudentQuiz = async (req, res, next) => {
   const { id } = req.params;
-  const studentID = req.user._id;
+  const studentID = req.user.id;
   try {
-    const quiz = await Quiz.findById(id);
-    if (!quiz) {
-      return res.status(404).send();
-    }
-    const submission = quiz.submissions.find(
-      (sub) => sub.studentID.toString() == studentID.toString()
-    );
-    if (!submission) {
-      return res.status(404).send();
-    }
+    const quiz = await prisma.quiz.findUnique({ where: { id } });
+    if (!quiz) return res.status(404).send();
+
+    const submission = await prisma.quizSubmission.findFirst({
+        where: { quizID: id, studentID }
+    });
+    if (!submission) return res.status(404).send();
     res.send({ totalMarks: quiz.totalMarks, submission });
   } catch (error) {
     next(error);
@@ -402,27 +288,27 @@ exports.getStudentQuiz = async (req, res, next) => {
 
 exports.getAllQuizzesOfStudent = async (req, res, next) => {
   try {
-    const studentID = req.user._id;
-
-    // get all classrooms of student and then get all assignments of those classrooms
-    const classrooms = await Classroom.find({ students: studentID });
-    const classroomIDs = classrooms.map((c) => c._id);
-    const quizzes = await Quiz.find({
-      classroomID: { $in: classroomIDs },
-    }).populate("subjectID").populate("classroomID").populate("createdBy");
-
-    // check if user has submitted the assignment and add isSubmitted to each assignment
-    const quizzesWithSubmission = quizzes.map((assignment) => {
-      const submission = assignment.submissions.find(
-        (s) => s.studentID.toString() == studentID.toString()
-      );
-      if (submission) {
-        return { ...assignment._doc, isSubmitted: true };
+    const studentID = req.user.id;
+    const quizzes = await prisma.quiz.findMany({
+      where: { classroom: { students: { some: { id: studentID } } } },
+      include: {
+          subject: true,
+          classroom: true,
+          creator: true,
+          files: true,
+          submissions: { where: { studentID } }
       }
-      return { ...assignment._doc, isSubmitted: false };
     });
 
-    res.send(quizzesWithSubmission);
+    const result = quizzes.map(q => ({
+        ...q,
+        isSubmitted: q.submissions.length > 0,
+        classroomID: q.classroom,
+        subjectID: q.subject,
+        creator: q.creator
+    }));
+
+    res.send(result);
   } catch (error) {
     next(error);
   }
@@ -430,44 +316,27 @@ exports.getAllQuizzesOfStudent = async (req, res, next) => {
 
 exports.getQuizForGrading = async (req, res, next) => {
   try {
-    const teacherID = req.user._id;
+    const teacherID = req.user.id;
     const { quizID } = req.params;
 
-    // return all submission of assignment based on students in classroomID
-    const quiz = await Quiz.findOne({
-      _id: quizID,
-      createdBy: teacherID,
-    }).populate("submissions.studentID");
-    if (!quiz) {
-      return res.status(404).send();
-    }
-    const classroomID = quiz.classroomID;
-    const classroom = await Classroom.findById(classroomID).populate({
-      path: "students",
-      select: "name email profilePic levelID subjects"
-    });
-    if (!classroom) {
-      return res.status(404).send();
-    }
-
-    // Filter students: include if they are enrolled in the subject, or if they have no subjects assigned (fallback to all students in classroom)
-    const students = classroom.students.filter(student => {
-      if (!student.subjects || student.subjects.length === 0) return true;
-      return student.subjects.some(sub => sub.toString() === quiz.subjectID.toString());
-    });
-
-    // return all students of classroom and check if they have submitted the quiz
-    const submissions = students.map((studentID) => {
-      const submission = quiz.submissions.find(
-        (s) => s.studentID._id.toString() == studentID._id.toString()
-      );
-      if (submission) {
-        return { submission: { ...submission._doc }, studentID };
+    const quiz = await prisma.quiz.findUnique({
+      where: { id: quizID },
+      include: {
+          submissions: { include: { student: true } },
+          classroom: { include: { students: true } }
       }
-      return { studentID };
+    });
+    if (!quiz || quiz.createdBy !== teacherID) return res.status(404).send();
+
+    const students = quiz.classroom.students.filter(student => 
+      student.subjects.includes(quiz.subjectID)
+    );
+    const submissions = students.map(student => {
+        const sub = quiz.submissions.find(s => s.studentID === student.id);
+        return sub ? { submission: sub, studentID: student } : { studentID: student };
     });
 
-    res.send({ ...quiz._doc, submissions });
+    res.send({ ...quiz, submissions });
   } catch (error) {
     next(error);
   }

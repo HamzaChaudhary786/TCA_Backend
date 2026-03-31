@@ -1,9 +1,5 @@
 const axios = require("axios");
-const mongoose = require("mongoose");
-const User = require("../../models/user");
-const Class = require("../../models/class");
-const Assignment = require("../../models/assignment");
-const Quiz = require("../../models/quiz");
+const prisma = require("../../db/prisma");
 
 const WA_URL = "https://graph.facebook.com/v22.0/1059127047279632/messages";
 const WHATSAPP_ACCESS_TOKEN = "EAAMjfiduOfMBQx7ZAcZC0gg9ZBFvkSVd1W0ut7ZCUYFPvRO0ciKTNbeeSwnuu0b8ZAZBG7529nZBN8ZCa4QXP7ZCJzbvqymbeDotXIj6dZCbAVqZCN0RoOkHlmFTX4vPryBqg1d6u3wpTX3BlQ8WySeVQL1o086kEu4hm8vUJ82mEExLxdvdapfgdZCreADUZBbTTBAZDZD";
@@ -80,9 +76,12 @@ exports.createWebHook = (req, res) => {
                     let students = cacheGet(cacheKey);
 
                     if (!students) {
-                        students = await User.find({ userType: "student", guardianEmail: text })
-                            .populate("levelID", "name")
-                            .lean();
+                        students = await prisma.user.findMany({
+                            where: { userType: "student", guardianEmail: text },
+                            include: { level: { select: { name: true } } }
+                        });
+                        // Map structure for compatibility
+                        students = students.map(s => ({ ...s, id: s.id, levelID: s.level ? { name: s.level.name } : null }));
                         cacheSet(cacheKey, students);
                     }
 
@@ -98,9 +97,12 @@ exports.createWebHook = (req, res) => {
                     let students = cacheGet(cacheKey);
 
                     if (!students) {
-                        students = await User.find({ userType: "student", guardianPhoneNumber: from })
-                            .populate("levelID", "name")
-                            .lean();
+                        students = await prisma.user.findMany({
+                            where: { userType: "student", guardianPhoneNumber: from },
+                            include: { level: { select: { name: true } } }
+                        });
+                        // Map structure for compatibility
+                        students = students.map(s => ({ ...s, id: s.id, levelID: s.level ? { name: s.level.name } : null }));
                         cacheSet(cacheKey, students);
                     }
 
@@ -154,43 +156,36 @@ async function handleAttendance(from, studentID) {
     const thirtyDaysAgo = new Date();
     thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
 
-    const data = await Class.aggregate([
-        {
-            $match: {
-                "attendance.studentID": new mongoose.Types.ObjectId(studentID),
-                startTime: { $gte: thirtyDaysAgo },
-            },
+    const records = await prisma.classAttendance.findMany({
+        where: {
+            studentID: studentID,
+            class: { startTime: { gte: thirtyDaysAgo } }
         },
-        { $unwind: "$attendance" },
-        { $match: { "attendance.studentID": new mongoose.Types.ObjectId(studentID) } },
-        {
-            $group: {
-                _id: "$subjectID",
-                totalClasses: { $sum: 1 },
-                presentCount: {
-                    $sum: { $cond: [{ $eq: ["$attendance.isPresent", true] }, 1, 0] },
-                },
-            },
-        },
-        {
-            $lookup: { from: "subjects", localField: "_id", foreignField: "_id", as: "subjectInfo" },
-        },
-        { $unwind: "$subjectInfo" },
-        {
-            $project: {
-                _id: 0,
-                subjectName: "$subjectInfo.name",
-                totalClasses: 1,
-                presentCount: 1,
-                attendancePercentage: {
-                    $cond: [
-                        { $eq: ["$totalClasses", 0] }, 0,
-                        { $multiply: [{ $divide: ["$presentCount", "$totalClasses"] }, 100] },
-                    ],
-                },
-            },
-        },
-    ]).allowDiskUse(true);
+        include: {
+            class: {
+                include: { subject: true }
+            }
+        }
+    });
+
+    const subjectMap = new Map();
+    for (const record of records) {
+        if (!record.class || !record.class.subject) continue;
+        const subjectName = record.class.subject.name;
+        if (!subjectMap.has(subjectName)) {
+            subjectMap.set(subjectName, { totalClasses: 0, presentCount: 0 });
+        }
+        const s = subjectMap.get(subjectName);
+        s.totalClasses++;
+        if (record.isPresent) s.presentCount++;
+    }
+
+    const data = Array.from(subjectMap.entries()).map(([name, stats]) => ({
+        subjectName: name,
+        totalClasses: stats.totalClasses,
+        presentCount: stats.presentCount,
+        attendancePercentage: stats.totalClasses === 0 ? 0 : (stats.presentCount / stats.totalClasses) * 100
+    }));
 
     if (!data.length) {
         return sendMessage(from, "📭 No attendance data found for the last 30 days.");
@@ -227,7 +222,7 @@ async function handleAssignments(from, studentID) {
     const fiveDaysAgo = new Date();
     fiveDaysAgo.setDate(fiveDaysAgo.getDate() - 5);
 
-    const data = await getSubmissionData(Assignment, studentID, fiveDaysAgo);
+    const data = await getSubmissionData("assignment", studentID, fiveDaysAgo);
 
     if (!data.length) {
         return sendMessage(from, "📭 No assignments submitted in the last 5 days.");
@@ -254,7 +249,7 @@ async function handleQuizzes(from, studentID) {
     const fiveDaysAgo = new Date();
     fiveDaysAgo.setDate(fiveDaysAgo.getDate() - 5);
 
-    const data = await getSubmissionData(Quiz, studentID, fiveDaysAgo);
+    const data = await getSubmissionData("quiz", studentID, fiveDaysAgo);
 
     if (!data.length) {
         return sendMessage(from, "📭 No quizzes submitted in the last 5 days.");
@@ -277,38 +272,31 @@ async function handleQuizzes(from, studentID) {
 // ─────────────────────────────────────────────
 // Shared aggregation for Assignment / Quiz
 // ─────────────────────────────────────────────
-async function getSubmissionData(Model, studentID, sinceDate) {
-    return Model.aggregate([
-        {
-            $match: {
-                "submissions.studentID": new mongoose.Types.ObjectId(studentID),
-                "submissions.submittedAt": { $gte: sinceDate },
-            },
+async function getSubmissionData(modelName, studentID, sinceDate) {
+    const items = await prisma[modelName].findMany({
+        where: {
+            submissions: { some: { studentID: studentID, submittedAt: { gte: sinceDate } } }
         },
-        { $unwind: "$submissions" },
-        {
-            $match: {
-                "submissions.studentID": new mongoose.Types.ObjectId(studentID),
-                "submissions.submittedAt": { $gte: sinceDate },
-            },
-        },
-        { $lookup: { from: "subjects", localField: "subjectID", foreignField: "_id", as: "subjectInfo" } },
-        { $unwind: "$subjectInfo" },
-        {
-            $project: {
-                _id: 0,
-                title: 1,
-                dueDate: 1,
-                totalMarks: 1,
-                subjectName: "$subjectInfo.name",
-                marksObtained: "$submissions.marks",
-                grade: "$submissions.grade",
-                feedback: "$submissions.feedback",
-                isLate: "$submissions.isLate",
-                submittedAt: "$submissions.submittedAt",
-            },
-        },
-    ]).allowDiskUse(true);
+        include: {
+            subject: true,
+            submissions: { where: { studentID: studentID, submittedAt: { gte: sinceDate } } }
+        }
+    });
+
+    return items.map(item => {
+        const sub = item.submissions[0];
+        return {
+            title: item.title,
+            dueDate: item.dueDate,
+            totalMarks: item.totalMarks,
+            subjectName: item.subject?.name,
+            marksObtained: sub?.marks,
+            grade: sub?.grade,
+            feedback: sub?.feedback,
+            isLate: sub?.isLate,
+            submittedAt: sub?.submittedAt
+        };
+    });
 }
 
 // ─────────────────────────────────────────────
@@ -402,11 +390,11 @@ async function replyStudentOptions(to, studentID, messageId) {
 exports.sendAdminBroadcast = async (req, res) => {
     try {
         const message = req.body.message || "🏫 School is OFF today due to weather conditions. Stay safe!";
-        const UserModel = req.clientInfo.tenantDB.models.User;
 
-        const guardians = await UserModel.find({ userType: "student" })
-            .select("guardianPhoneNumber")
-            .lean();
+        const guardians = await prisma.user.findMany({
+            where: { userType: "student" },
+            select: { guardianPhoneNumber: true }
+        });
 
         const uniquePhones = [...new Set(guardians.map((g) => g.guardianPhoneNumber).filter(Boolean))];
 
@@ -477,4 +465,4 @@ function formatHelp() {
         `_Example: hello@gmail.com_\n\n` +
         `━━━━━━━━━━━━━━━━━━━━`
     );
-}
+}
