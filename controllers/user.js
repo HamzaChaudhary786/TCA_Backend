@@ -1,25 +1,17 @@
 const passport = require("passport");
-const User = require("../models/user");
-const Classroom = require("../models/classroom");
-const Class = require("../models/class");
+const prisma = require("../db/prisma");
 const bcrypt = require("bcryptjs");
-const Assignment = require("../models/assignment");
-const Quiz = require("../models/quiz");
-const Device = require("../models/devices");
-const mongoose = require("mongoose");
-const Activity = require("../models/activities");
-const Level = require("../models/level");
-
-const userRepository = require("../repositories/userRepository");
-const Subject = require("../models/subject");
-const Attendance = require("../models/attendence");
 const moment = require("moment");
+const userRepository = require("../repositories/userRepository");
 
 exports.register = async (req, res, next) => {
   try {
     const data = req.body;
+    if (data.email) data.email = data.email.trim().toLowerCase();
+    if (data.guardianEmail) data.guardianEmail = data.guardianEmail.trim().toLowerCase();
+
     // Check if the user already exists
-    const foundUser = await User.findOne({ email: data.email });
+    const foundUser = await prisma.user.findUnique({ where: { email: data.email } });
     if (foundUser) {
       return res.status(401).send("User already exists");
     }
@@ -44,25 +36,24 @@ exports.register = async (req, res, next) => {
       }
     }
 
-    // Optional fields for teacher
-    // if (data.userType === "teacher") {
-    //   if (!data.qualification || !data.cv) {
-    //     return res.status(400).send("Qualification and CV are required");
-    //   }
-    // }
-
     // Hash student password
     const plainPassword = data.password;
     data["password"] = bcrypt.hashSync(data.password, 8);
-    console.log(data);
+
+    // Prisma create data (mapping nested subscription fields)
+    const createData = {
+      ...data,
+      subscriptionActive: data.subscription?.isActive ?? false,
+      subscriptionExpiresAt: data.subscription?.expiresAt ? new Date(data.subscription.expiresAt) : null,
+    };
+    delete createData.subscription; // Remove mongo-style nested object
 
     // Save user data
-    const user = new User(data);
-    await user.save();
+    let user = await prisma.user.create({ data: createData });
 
     // Create parent account for student
     if (data.userType === "student") {
-      let parent = await User.findOne({ email: data.guardianEmail });
+      let parent = await prisma.user.findUnique({ where: { email: data.guardianEmail } });
 
       if (parent && parent.userType !== "parent") {
         return res.status(400).send(`The guardian email ${data.guardianEmail} is already registered as a ${parent.userType}. Please use a different email or contact support.`);
@@ -77,25 +68,22 @@ exports.register = async (req, res, next) => {
           userType: "parent",
           phoneNumber: data.guardianPhoneNumber,
         };
-        const parentAccount = new User(parentData);
-        parent = await parentAccount.save();
+        parent = await prisma.user.create({ data: parentData });
       }
 
       // Update student's guardianId with the parent's ID
-      user.guardianId = parent._id;
-      await user.save();
+      user = await prisma.user.update({
+        where: { id: user.id },
+        data: { guardianId: parent.id }
+      });
     }
 
-    res.send({ ...user._doc, password: undefined });
+    res.send({ ...user, password: undefined });
   } catch (err) {
-    if (err.name === 'ValidationError') {
-      const messages = Object.values(err.errors).map(val => val.message);
-      return res.status(400).send(messages.join(', '));
-    }
-    if (err.code === 11000) {
-      const field = Object.keys(err.keyValue)[0];
-      const value = err.keyValue[field];
-      return res.status(400).send(`${field.charAt(0).toUpperCase() + field.slice(1)} '${value}' already exists.`);
+    // Unique constraint error in Prisma (P2002)
+    if (err.code === 'P2002') {
+      const field = err.meta.target[0];
+      return res.status(400).send(`${field.charAt(0).toUpperCase() + field.slice(1)} already exists.`);
     }
     next(err);
   }
@@ -104,53 +92,70 @@ exports.register = async (req, res, next) => {
 exports.login = async (req, res, next) => {
   passport.authenticate("local", async function (err, foundUser, info) {
     if (err) {
-      // If an error occurs during authentication, send a single error response
       return res.status(500).send({ message: "Internal Server Error" });
     }
 
     if (!foundUser) {
-      // If the user is not found or password is incorrect, return a single error response
       return res.status(400).send({ message: info.message });
     }
 
-    console.log(foundUser, "found");
-
     try {
       // Fetch level details if the user exists
-      const level = await Level.findOne(foundUser.levelId).lean();
-      const levelName = level ? level.name : null;
+      let levelName = null;
+      if (foundUser.levelID) {
+        const level = await prisma.level.findUnique({ where: { id: foundUser.levelID } });
+        levelName = level ? level.name : null;
+      }
 
-      // --- DYNAMIC SUBSCRIPTION CHECK ---
+      // --- 1. INDIVIDUAL BLOCK CHECK ---
+      if (foundUser.isBlocked) {
+        return res.status(403).send({ message: "Your account has been blocked. Please contact the administrator." });
+      }
+
+      // --- 2. DYNAMIC SUBSCRIPTION & ORGANIZATION FEE CHECK ---
       if (foundUser.userType !== 'super_admin') {
-        let subscriptionUser = foundUser;
+        let organization = foundUser;
 
-        // If not admin, find the admin to check THEIR subscription
         if (foundUser.userType !== 'admin') {
-          // Assuming single tenant/admin for now as per requirement "if admin subscribe then dynamicall all users"
-          const adminUser = await User.findOne({ userType: 'admin' });
-          if (adminUser) {
-            subscriptionUser = adminUser;
-          } else {
-            console.warn("No admin found to check subscription against. Allowing login.");
-          }
+          // In a single-tenant system, the organization is the 'admin' user
+          organization = await prisma.user.findFirst({ where: { userType: 'admin' } });
         }
 
-        // Check subscription logic on the target user (Self or Admin)
-        const isSubscriptionActive = subscriptionUser.subscription &&
-          subscriptionUser.subscription.expiresAt &&
-          new Date(subscriptionUser.subscription.expiresAt) > new Date();
+        if (!organization) {
+          // This should not happen in a configured system
+          return res.status(403).send({ message: "Organization setup incomplete. Please contact support." });
+        }
 
-        // Check if explicitly set to inactive (optional, depending on your model usage)
-        // const isExplicitlyActive = subscriptionUser.subscription?.isActive !== false;
+        const isSubscriptionExpired = organization.subscriptionExpiresAt &&
+          new Date(organization.subscriptionExpiresAt) < new Date();
+        
+        const isFeesPaid = organization.feesPaid;
 
-        if (!isSubscriptionActive) {
+        if (isSubscriptionExpired || !isFeesPaid) {
           const msg = foundUser.userType === 'admin'
-            ? "Your subscription has expired. Please renew to continue."
-            : "School subscription has expired. Please contact the administrator.";
+            ? "Your organization's subscription has expired or fees are unpaid. Please contact support."
+            : "The school/organization access is currently suspended due to unpaid fees. Please contact your administrator.";
           return res.status(403).send({ message: msg });
         }
       }
-      // ----------------------------------
+
+      // --- STUDENT FEE CHECK ---
+      if (foundUser.userType === 'student') {
+        const overdueFee = await prisma.fee.findFirst({
+          where: {
+            studentID: foundUser.id,
+            status: 'unpaid',
+            dueDate: { lt: new Date() }
+          }
+        });
+
+        if (overdueFee) {
+          return res.status(403).send({ 
+            message: "Access Denied: You have unpaid fees. Please contact the administrator or check your parent portal.",
+            feeStatus: "unpaid"
+          });
+        }
+      }
 
       // Attempt to log in the user
       req.logIn(foundUser, function (err) {
@@ -158,32 +163,12 @@ exports.login = async (req, res, next) => {
           return res.status(500).send({ message: "Failed to log in user" });
         }
 
-
-        // Prepare the user object to send
-        const userToSend = foundUser.toObject();
-
-        // If simple user (not super_admin/admin) and we found an admin to inherit from
-        // We verified above that the admin IS active (otherwise we would have 403'd)
-        // So we can visually show the user they are subscribed by inheriting the admin's subscription details
-        if (foundUser.userType !== 'super_admin' && foundUser.userType !== 'admin') {
-          // We need to re-fetch admin here or scope the variable so it's accessible. 
-          // Since we didn't save 'adminUser' in the wider scope in the previous block, let's just do a quick lookup or better yet, refactor the previous block to save it.
-          // Actually, let's just do it cleanly:
-        }
-
-        // Wait, I can't easily access 'subscriptionUser' from the scope above inside this callback without refactoring.
-        // Let's refactor the whole function slightly to be cleaner.
-
         return res.send({
-          ...userToSend,
+          ...foundUser,
           levelName,
-          // If we passed the check above, and we are not super_admin, we effectively have an active subscription.
-          // However, let's be precise. 
-          // If I am a student, I want to see the expiry date of the GLOBAL/SCHOOL subscription.
         });
       });
     } catch (fetchError) {
-      // Catch errors while fetching level data
       return res.status(500).send({ message: "Failed to fetch user data" });
     }
   })(req, res, next);
@@ -205,21 +190,31 @@ exports.logout = (req, res, next) => {
 
 exports.updateUser = async (req, res, next) => {
   try {
-    if (req.body.email) {
-      // email is not allowed to be updated
-      delete req.body.email;
-    }
+    const { 
+      name, profilePic, bio, dob, phoneNumber, gender, 
+      experience, qualification, cv, 
+      guardianName, guardianPhoneNumber 
+    } = req.body;
 
-    if (req.body.guardianEmail) {
-      // guardian email is not allowed to be updated
-      delete req.body.guardianEmail;
-    }
+    const updateData = {};
+    if (name !== undefined) updateData.name = name;
+    if (profilePic !== undefined) updateData.profilePic = profilePic;
+    if (bio !== undefined) updateData.bio = bio;
+    if (dob !== undefined) updateData.dob = dob ? new Date(dob) : null;
+    if (phoneNumber !== undefined) updateData.phoneNumber = phoneNumber;
+    if (gender !== undefined) updateData.gender = gender;
+    if (experience !== undefined) updateData.experience = experience;
+    if (qualification !== undefined) updateData.qualification = qualification;
+    if (cv !== undefined) updateData.cv = cv;
+    if (guardianName !== undefined) updateData.guardianName = guardianName;
+    if (guardianPhoneNumber !== undefined) updateData.guardianPhoneNumber = guardianPhoneNumber;
 
-    const user = await User.findByIdAndUpdate(req.user._id, req.body, {
-      new: true,
+    const user = await prisma.user.update({
+      where: { id: req.user.id },
+      data: updateData
     });
 
-    return res.status(200).send(user._doc);
+    return res.status(200).send(user);
   } catch (err) {
     next(err);
   }
@@ -233,13 +228,10 @@ exports.updateStudentSubject = async (req, res, next) => {
   try {
     const { studentId } = req.params;
 
-
-
-    const user = await User.findByIdAndUpdate(
-      studentId,
-      { subjects: req.body }, // directly use the array
-      { new: true }
-    );
+    const user = await prisma.user.update({
+      where: { id: studentId },
+      data: { subjects: req.body }
+    });
 
     return res.status(200).send(user);
   } catch (err) {
@@ -263,66 +255,63 @@ exports.bulkUpdateStudentSubjects = async (req, res, next) => {
     let filter = { userType: "student", levelID: levelId };
 
     if (classroomId) {
-      const classroom = await Classroom.findById(classroomId);
+      const classroom = await prisma.classroom.findUnique({
+        where: { id: classroomId },
+        include: { students: { select: { id: true } } }
+      });
       if (!classroom) {
         return res.status(404).send({ message: "Classroom not found." });
       }
-      filter._id = { $in: classroom.students };
+      filter.id = { in: classroom.students.map(s => s.id) };
     }
 
-    const result = await User.updateMany(
-      filter,
-      { subjects: subjectIds }, // Replaces existing subjects with the provided array
-      { new: true }
-    );
+    const result = await prisma.user.updateMany({
+      where: filter,
+      data: { subjects: subjectIds }
+    });
 
     return res.status(200).send({
       success: true,
-      message: `${result.modifiedCount} students updated successfully.`,
+      message: `${result.count} students updated successfully.`,
       data: result,
     });
   } catch (err) {
-    console.log(err);
     next(err);
   }
 };
 
 exports.getUsersNotInClassroom = async (req, res, next) => {
-  // console.log(req.user);
   try {
     const { levelID } = req.params;
 
-    const classroomsWithLevel = await Classroom.find({ levelID });
+    const classroomsWithLevel = await prisma.classroom.findMany({
+      where: { levelID },
+      include: {
+        students: { select: { id: true } },
+        teachers: { select: { teacherID: true } }
+      }
+    });
 
-    // Extract user IDs from the classrooms
-    const usersInClassroom = classroomsWithLevel.reduce((users, classroom) => {
-      users.push(
-        ...classroom.students,
-        ...classroom.teachers.map((teacher) => teacher.teacher)
-      );
-      return users;
+    const usersInClassroom = classroomsWithLevel.reduce((acc, classroom) => {
+      acc.push(...classroom.students.map(s => s.id));
+      acc.push(...classroom.teachers.map(t => t.teacherID));
+      return acc;
     }, []);
 
-    // Find users not in any classroom with the given levelID
-    const usersNotInClassroom = await User.find({
-      $and: [
-        { _id: { $nin: usersInClassroom } },
-        {
-          $or: [
-            { userType: { $ne: "student" } },
-            { $and: [{ userType: "student" }, { levelID }] },
-          ],
-        },
-      ],
-      userType: { $ne: "admin" }, // Exclude users with userType "admin"
+    const usersNotInClassroom = await prisma.user.findMany({
+      where: {
+        id: { notIn: usersInClassroom },
+        userType: { not: 'admin' },
+        OR: [
+          { userType: { not: 'student' } },
+          { userType: 'student', levelID: levelID }
+        ]
+      }
     });
+
     const result = {
-      students: usersNotInClassroom.filter(
-        (user) => user.userType === "student"
-      ),
-      teachers: usersNotInClassroom.filter(
-        (user) => user.userType === "teacher"
-      ),
+      students: usersNotInClassroom.filter(user => user.userType === "student"),
+      teachers: usersNotInClassroom.filter(user => user.userType === "teacher"),
     };
     res.send(result);
   } catch (error) {
@@ -332,7 +321,7 @@ exports.getUsersNotInClassroom = async (req, res, next) => {
 
 exports.getAllStudents = async (req, res, next) => {
   try {
-    const users = await User.find({ userType: "student" });
+    const users = await prisma.user.findMany({ where: { userType: "student" } });
     res.send(users);
   } catch (error) {
     next(error);
@@ -341,20 +330,15 @@ exports.getAllStudents = async (req, res, next) => {
 
 exports.getAllStudentsWithLevel = async (req, res, next) => {
   try {
-    // Extract levelId from route parameters
     const { levelId } = req.params;
+    if (!levelId) return res.status(400).send({ message: "Level Id is required." });
 
-    if (!levelId) {
-      return res.status(400).send({ message: "Level Id is required." });
-    }
-
-    // Fetch students directly based on userType and levelID
-    const students = await User.find({
-      userType: "student",
-      levelID: levelId.toString(),
+    const students = await prisma.user.findMany({
+      where: {
+        userType: "student",
+        levelID: levelId
+      }
     });
-
-    console.log(students, "filtered students");
 
     res.send(students);
   } catch (error) {
@@ -368,11 +352,10 @@ exports.getAllStudentsWithLevel = async (req, res, next) => {
 
 exports.getAllAdmins = async (req, res, next) => {
   try {
-    // Strict check for Super Admin
     if (req.user.userType !== 'super_admin') {
       return res.status(403).send({ message: "Access denied. Super Admin only." });
     }
-    const admins = await User.find({ userType: "admin" });
+    const admins = await prisma.user.findMany({ where: { userType: "admin" } });
     res.send(admins);
   } catch (error) {
     next(error);
@@ -381,7 +364,9 @@ exports.getAllAdmins = async (req, res, next) => {
 
 exports.getUsers = async (req, res, next) => {
   try {
-    const users = await User.find({ userType: { $ne: "admin" } });
+    const users = await prisma.user.findMany({
+      where: { userType: { not: "admin" } }
+    });
     res.send(users);
   } catch (error) {
     next(error);
@@ -391,13 +376,11 @@ exports.getUsers = async (req, res, next) => {
 exports.acceptUser = async (req, res, next) => {
   try {
     const { userID } = req.params;
-    // console.log(userID);
-    const user = await User.findByIdAndUpdate(
-      userID,
-      { isAccepted: true },
-      { new: true }
-    );
-    res.send(user?._doc);
+    const user = await prisma.user.update({
+      where: { id: userID },
+      data: { isAccepted: true }
+    });
+    res.send(user);
   } catch (error) {
     next(error);
   }
@@ -406,8 +389,8 @@ exports.acceptUser = async (req, res, next) => {
 exports.rejectUser = async (req, res, next) => {
   try {
     const { userID } = req.params;
-    const user = await User.findByIdAndDelete(userID);
-    res.send(user._doc);
+    const user = await prisma.user.delete({ where: { id: userID } });
+    res.send(user);
   } catch (error) {
     next(error);
   }
@@ -415,87 +398,69 @@ exports.rejectUser = async (req, res, next) => {
 
 exports.getStudentsOfTeacher = async (req, res, next) => {
   try {
-    const teacherID = req.user._id;
+    const teacherID = req.user.id;
 
-    const classrooms = await Classroom.find({
-      teachers: {
-        $elemMatch: {
-          teacher: teacherID,
-        },
+    const classrooms = await prisma.classroom.findMany({
+      where: {
+        teachers: {
+          some: { teacherID: teacherID }
+        }
       },
-    })
-      .populate("students")
-      .populate("teachers.subject");
+      include: {
+        students: true,
+        teachers: {
+          include: { subject: true }
+        }
+      }
+    });
 
-    const students = [];
+    const studentList = [];
+
+    // Get all class sessions for these classrooms to avoid N+1 queries
+    const classroomIds = classrooms.map(c => c.id);
+    const allClassSessions = await prisma.class.findMany({
+      where: { classroomID: { in: classroomIds } },
+      include: { attendance: true }
+    });
 
     for (const clas of classrooms) {
-      const found = clas.teachers.find(
-        (tea) => tea.teacher.toString() == teacherID
-      );
+      const teacherInfo = clas.teachers.find(t => t.teacherID === teacherID);
+      const subjectID = teacherInfo.subjectID;
 
       for (const student of clas.students) {
         // Only include students taking the specific subject taught by this teacher
-        const studentSubjects = student.subjects ? student.subjects.map(s => s.toString()) : [];
-        if (!studentSubjects.includes(found.subject._id.toString())) {
+        if (!student.subjects.includes(subjectID)) {
           continue;
         }
 
-        // ⬇️ Calculate average attendance for each student
-        const pipeline = [
-          {
-            $match: {
-              classroomID: clas._id,
-              subjectID: found.subject._id,
-            },
-          },
-          {
-            $project: {
-              matchedAttendance: {
-                $filter: {
-                  input: "$attendance",
-                  as: "att",
-                  cond: {
-                    $eq: [
-                      "$$att.studentID",
-                      student._id,
-                    ],
-                  },
-                },
-              },
-            },
-          },
-        ];
-
-        const classes = await Class.aggregate(pipeline);
+        // Calculate attendance from pre-fetched data
+        const relevantClasses = allClassSessions.filter(c =>
+          c.classroomID === clas.id && c.subjectID === subjectID
+        );
 
         let totalMarked = 0;
         let presentCount = 0;
 
-        classes.forEach((cls) => {
-          cls.matchedAttendance.forEach((record) => {
-            if (typeof record.isPresent !== "undefined") {
-              totalMarked++;
-              if (record.isPresent || record.late) presentCount++;
-            }
-          });
+        relevantClasses.forEach(c => {
+          const record = c.attendance.find(a => a.studentID === student.id);
+          if (record) {
+            totalMarked++;
+            if (record.isPresent || record.late) presentCount++;
+          }
         });
 
-        let avgAttendancePer = 0;
-        if (totalMarked > 0) {
-          avgAttendancePer = (presentCount / totalMarked) * 100;
-        }
+        const avgAttendancePer = totalMarked > 0 ? (presentCount / totalMarked) * 100 : 0;
 
-        students.push({
-          ...student._doc,
-          classroom: { _id: clas._id, name: clas.name },
-          subject: { _id: found.subject._id, name: found.subject.name },
+        studentList.push({
+          ...student,
+          classroom: { id: clas.id, name: clas.name },
+          subject: { id: subjectID, name: teacherInfo.subject.name },
           avgAttendancePer: avgAttendancePer.toFixed(2),
         });
       }
     }
 
-    res.send(students);
+    res.send(studentList);
   } catch (error) {
     next(error);
   }
@@ -513,131 +478,85 @@ exports.getStudentReportForTeacher = async (req, res, next) => {
       return res.status(400).send("Student, classroom, and subject IDs are required");
     }
 
-    const sID = new mongoose.Types.ObjectId(studentID);
-    const cID = new mongoose.Types.ObjectId(classroomID);
-    const subID = new mongoose.Types.ObjectId(subjectID);
-
-    const user = await User.findById(studentID).select("-password");
+    const user = await prisma.user.findUnique({
+      where: { id: studentID }
+    });
     if (!user) return res.status(404).send("Student not found");
 
-    const classroom = await Classroom.findById(classroomID);
+    const classroom = await prisma.classroom.findUnique({ where: { id: classroomID } });
     if (!classroom) return res.status(404).send("Classroom not found");
 
-    const pipeline = [
-      {
-        $match: {
-          classroomID: cID,
-          subjectID: subID,
-        },
+    // Fetch classes with attendance for the specific student
+    const classes = await prisma.class.findMany({
+      where: {
+        classroomID: classroomID,
+        subjectID: subjectID,
       },
-      {
-        $project: {
-          matchedAttendance: {
-            $slice: [
-              {
-                $filter: {
-                  input: "$attendance",
-                  as: "att",
-                  cond: {
-                    $eq: ["$$att.studentID", sID],
-                  },
-                },
-              },
-              1
-            ]
-          },
-          title: 1,
-          startTime: 1,
-          endTime: 1,
-          createdBy: 1,
-          oneTime: 1,
-          classroomID: 1,
-          subjectID: 1,
-          teacher: 1,
-          meetLink: 1,
-        },
+      include: {
+        attendance: {
+          where: { studentID: studentID }
+        }
       },
-      {
-        $sort: { startTime: 1 }
-      }
-    ];
+      orderBy: { startTime: 'asc' }
+    });
 
-    const classes = await Class.aggregate(pipeline);
-
-
-
-    const assignments = await Assignment.find({
-      classroomID: cID,
-      subjectID: subID,
-    }).populate("subjectID");
-
-    const quizes = await Quiz.find({
-      classroomID: cID,
-      subjectID: subID,
-    }).populate("subjectID");
-
-    let avgAttendancePer = 0;
-    let presentCount = 0;
-    let avgAssMarksPer = 0;
-    let avgQuizMarksPer = 0;
-
-    // Deduplicate sessions by startTime locally to ensure "one time" display
-    const sessionMap = new Map();
-    classes.forEach((item) => {
-      const timeKey = item.startTime.toISOString();
-      // If we have multiple docs for same time, prefer the one with attendance data
-      const hasAttendance = item.matchedAttendance && item.matchedAttendance.length > 0;
-
-      if (!sessionMap.has(timeKey) || (!sessionMap.get(timeKey).hasData && hasAttendance)) {
-        sessionMap.set(timeKey, {
-          ...item,
-          hasData: hasAttendance
-        });
+    const assignments = await prisma.assignment.findMany({
+      where: { classroomID, subjectID },
+      include: {
+        subject: true,
+        submissions: { where: { studentID: studentID } }
       }
     });
 
-    const uniqueClasses = Array.from(sessionMap.values());
+    const quizes = await prisma.quiz.findMany({
+      where: { classroomID, subjectID },
+      include: {
+        subject: true,
+        submissions: { where: { studentID: studentID } }
+      }
+    });
+
+    let presentCount = 0;
     let totalAttendanceRecords = 0;
 
-    // Process individual class sessions
+    const uniqueClasses = classes; // Already sorted and filtered unique sessions in this context
+
     uniqueClasses.forEach((item) => {
-      if (item.matchedAttendance && item.matchedAttendance.length > 0) {
+      if (item.attendance && item.attendance.length > 0) {
         totalAttendanceRecords++;
-        if (item.matchedAttendance[0].isPresent || item.matchedAttendance[0].late) {
+        if (item.attendance[0].isPresent || item.attendance[0].late) {
           presentCount++;
         }
       }
     });
 
-    if (totalAttendanceRecords > 0) {
-      avgAttendancePer = (presentCount / totalAttendanceRecords) * 100;
-    }
+    const avgAttendancePer = totalAttendanceRecords > 0 ? (presentCount / totalAttendanceRecords) * 100 : 0;
 
     const gradedAssignments = assignments.filter(ass =>
-      ass.submissions.some(sub => sub.studentID.toString() === studentID && typeof sub.marks !== 'undefined')
+      ass.submissions.length > 0 && typeof ass.submissions[0].marks !== 'undefined'
     );
 
+    let avgAssMarksPer = 0;
     if (gradedAssignments.length > 0) {
       let totalObtained = 0;
       let totalMax = 0;
       gradedAssignments.forEach(ass => {
-        const sub = ass.submissions.find(s => s.studentID.toString() === studentID);
-        totalObtained += sub.marks || 0;
+        totalObtained += ass.submissions[0].marks || 0;
         totalMax += ass.totalMarks;
       });
       avgAssMarksPer = ((totalObtained / totalMax) * 100).toFixed(0);
     }
 
     const gradedQuizzes = quizes.filter(q =>
-      q.submissions.some(sub => sub.studentID.toString() === studentID && typeof sub.marks !== 'undefined')
+      q.submissions.length > 0 && typeof q.submissions[0].marks !== 'undefined'
     );
 
+    let avgQuizMarksPer = 0;
     if (gradedQuizzes.length > 0) {
       let totalObtained = 0;
       let totalMax = 0;
       gradedQuizzes.forEach(q => {
-        const sub = q.submissions.find(s => s.studentID.toString() === studentID);
-        totalObtained += sub.marks || 0;
+        totalObtained += q.submissions[0].marks || 0;
         totalMax += q.totalMarks;
       });
       avgQuizMarksPer = ((totalObtained / totalMax) * 100).toFixed(0);
@@ -652,18 +571,8 @@ exports.getStudentReportForTeacher = async (req, res, next) => {
       return "F";
     };
 
-    const mergedAttendanceRecords = [
-      ...uniqueClasses.map(c => ({
-        matchedAttendance: c.matchedAttendance,
-        title: c.title,
-        startTime: c.startTime,
-        endTime: c.endTime,
-        type: "session"
-      }))
-    ];
-
     res.send({
-      user: user._doc,
+      user: user,
       averageAssignmentMarks: {
         percentage: avgAssMarksPer,
         grade: calculateGrade(avgAssMarksPer),
@@ -673,13 +582,10 @@ exports.getStudentReportForTeacher = async (req, res, next) => {
         grade: calculateGrade(avgQuizMarksPer),
       },
       assignments: assignments.map((ass) => {
-        const submission = ass.submissions.find(
-          (sub) => sub.studentID.toString() == studentID
-        );
-        const per = ass.totalMarks > 0 ? ((submission?.marks || 0) / ass.totalMarks) * 100 : 0;
+        const submission = ass.submissions[0];
         return {
           title: ass.title,
-          subject: ass.subjectID?.name || "Subject",
+          subject: ass.subject?.name || "Subject",
           totalMarks: ass.totalMarks,
           obtainedMarks: submission?.marks,
           feedback: submission?.feedback || "",
@@ -689,13 +595,10 @@ exports.getStudentReportForTeacher = async (req, res, next) => {
         };
       }),
       quizes: quizes.map((ass) => {
-        const submission = ass.submissions.find(
-          (sub) => sub.studentID.toString() == studentID
-        );
-        const per = ass.totalMarks > 0 ? ((submission?.marks || 0) / ass.totalMarks) * 100 : 0;
+        const submission = ass.submissions[0];
         return {
           title: ass.title,
-          subject: ass.subjectID?.name || "Subject",
+          subject: ass.subject?.name || "Subject",
           totalMarks: ass.totalMarks,
           obtainedMarks: submission?.marks,
           feedback: submission?.feedback || "",
@@ -704,7 +607,16 @@ exports.getStudentReportForTeacher = async (req, res, next) => {
           isSubmitted: !!submission,
         };
       }),
-      attendance: { classes: mergedAttendanceRecords, avgAttendancePer }
+      attendance: {
+        classes: uniqueClasses.map(c => ({
+          matchedAttendance: c.attendance,
+          title: c.title,
+          startTime: c.startTime,
+          endTime: c.endTime,
+          type: "session"
+        })),
+        avgAttendancePer
+      }
     });
   } catch (error) {
     next(error);
@@ -725,131 +637,101 @@ exports.getStudentGradesForSubject = async (req, res, next) => {
       return "F";
     };
 
-    // Fetch all assignments and quizzes for the classrooms the student is in for this subject
-    const userAssignmentsAndQuizzes = await Classroom.aggregate([
-      {
-        $match: {
-          students: new mongoose.Types.ObjectId(studentID),
-        },
+    // Find classrooms the student is in
+    const userClassrooms = await prisma.classroom.findMany({
+      where: { students: { some: { id: studentID } } },
+      select: { id: true }
+    });
+    const classroomIds = userClassrooms.map(c => c.id);
+
+    // Fetch assignments for these classrooms and this subject
+    const assignments = await prisma.assignment.findMany({
+      where: {
+        subjectID: subjectID,
+        classroomID: { in: classroomIds }
       },
-      {
-        $lookup: {
-          from: "assignments",
-          localField: "_id",
-          foreignField: "classroomID",
-          as: "assignments",
-        },
-      },
-      {
-        $lookup: {
-          from: "quizzes",
-          localField: "_id",
-          foreignField: "classroomID",
-          as: "quizzes",
-        },
-      },
-      {
-        $project: {
-          assignments: {
-            $filter: {
-              input: "$assignments",
-              as: "assignment",
-              cond: { $eq: ["$$assignment.subjectID", new mongoose.Types.ObjectId(subjectID)] }
-            }
-          },
-          quizzes: {
-            $filter: {
-              input: "$quizzes",
-              as: "quiz",
-              cond: { $eq: ["$$quiz.subjectID", new mongoose.Types.ObjectId(subjectID)] }
-            }
-          }
-        }
+      include: {
+        submissions: { where: { studentID: studentID } }
       }
-    ]);
+    });
 
-    const studentAssignments = [];
-    const studentQuizzes = [];
-
-    if (userAssignmentsAndQuizzes.length > 0) {
-      userAssignmentsAndQuizzes.forEach(classroomData => {
-        classroomData.assignments.forEach(ass => {
-          const submission = ass.submissions.find(s => s.studentID.toString() === studentID.toString());
-          const isGraded = typeof submission?.marks !== 'undefined' && submission?.marks !== null;
-          let grade = submission?.grade;
-          if (!grade && isGraded) {
-            grade = calculateGrade((submission.marks / ass.totalMarks) * 100);
-          }
-          studentAssignments.push({
-            _id: ass._id,
-            title: ass.title,
-            totalMarks: ass.totalMarks,
-            obtainedMarks: submission?.marks,
-            feedback: submission?.feedback || "",
-            grade: grade || "-",
-            deadline: ass.dueDate,
-            isSubmitted: !!submission,
-            submittedAt: submission?.submittedAt,
-            isGraded: isGraded
-          });
-        });
-
-        classroomData.quizzes.forEach(q => {
-          const submission = q.submissions.find(s => s.studentID.toString() === studentID.toString());
-          const isGraded = typeof submission?.marks !== 'undefined' && submission?.marks !== null;
-          let grade = submission?.grade;
-          if (!grade && isGraded) {
-            grade = calculateGrade((submission.marks / q.totalMarks) * 100);
-          }
-          studentQuizzes.push({
-            _id: q._id,
-            title: q.title,
-            totalMarks: q.totalMarks,
-            obtainedMarks: submission?.marks,
-            feedback: submission?.feedback || "",
-            grade: grade || "-",
-            deadline: q.dueDate,
-            isSubmitted: !!submission,
-            submittedAt: submission?.submittedAt,
-            isGraded: isGraded
-          });
-        });
-      });
-    }
-
-    const classes = await Class.aggregate([
-      {
-        $match: {
-          subjectID: new mongoose.Types.ObjectId(subjectID),
-          classroomID: { $in: await Classroom.find({ students: new mongoose.Types.ObjectId(studentID) }).distinct("_id") }
-        },
+    // Fetch quizzes for these classrooms and this subject
+    const quizzes = await prisma.quiz.findMany({
+      where: {
+        subjectID: subjectID,
+        classroomID: { in: classroomIds }
       },
-      {
-        $project: {
-          matchedAttendance: {
-            $filter: {
-              input: "$attendance",
-              as: "attendance",
-              cond: {
-                $eq: ["$$attendance.studentID", new mongoose.Types.ObjectId(studentID)],
-              },
-            },
-          },
-          title: 1,
-          startTime: 1,
-          endTime: 1,
-        },
+      include: {
+        submissions: { where: { studentID: studentID } }
+      }
+    });
+
+    const studentAssignments = assignments.map(ass => {
+      const submission = ass.submissions[0];
+      const isGraded = typeof submission?.marks !== 'undefined' && submission?.marks !== null;
+      let grade = submission?.grade;
+      if (!grade && isGraded) {
+        grade = calculateGrade((submission.marks / ass.totalMarks) * 100);
+      }
+      return {
+        id: ass.id,
+        title: ass.title,
+        totalMarks: ass.totalMarks,
+        obtainedMarks: submission?.marks,
+        feedback: submission?.feedback || "",
+        grade: grade || "-",
+        deadline: ass.dueDate,
+        isSubmitted: !!submission,
+        submittedAt: submission?.submittedAt,
+        isGraded: isGraded
+      };
+    });
+
+    const studentQuizzes = quizzes.map(q => {
+      const submission = q.submissions[0];
+      const isGraded = typeof submission?.marks !== 'undefined' && submission?.marks !== null;
+      let grade = submission?.grade;
+      if (!grade && isGraded) {
+        grade = calculateGrade((submission.marks / q.totalMarks) * 100);
+      }
+      return {
+        id: q.id,
+        title: q.title,
+        totalMarks: q.totalMarks,
+        obtainedMarks: submission?.marks,
+        feedback: submission?.feedback || "",
+        grade: grade || "-",
+        deadline: q.dueDate,
+        isSubmitted: !!submission,
+        submittedAt: submission?.submittedAt,
+        isGraded: isGraded
+      };
+    });
+
+    // Fetch classes (sessions) to calculate attendance
+    const classes = await prisma.class.findMany({
+      where: {
+        subjectID: subjectID,
+        classroomID: { in: classroomIds },
+        attendance: { some: { studentID: studentID } }
       },
-    ]);
+      include: {
+        attendance: { where: { studentID: studentID } }
+      }
+    });
 
-    let avgAttendancePer = 0;
-    let presentCount = 0;
-    let absentCount = 0;
-    let lateCount = 0;
+    const formattedClasses = classes.map(c => ({
+      matchedAttendance: c.attendance,
+      title: c.title,
+      startTime: c.startTime,
+      endTime: c.endTime
+    }));
 
-    if (classes.length > 0) {
-      classes.forEach((item) => {
+    let totalAttendanceRecords = 0;
+    if (formattedClasses.length > 0) {
+      formattedClasses.forEach((item) => {
         if (item.matchedAttendance && item.matchedAttendance.length > 0) {
+          totalAttendanceRecords++;
           if (item.matchedAttendance[0].late) {
             lateCount++;
           } else if (item.matchedAttendance[0].isPresent) {
@@ -859,7 +741,7 @@ exports.getStudentGradesForSubject = async (req, res, next) => {
           }
         }
       });
-      avgAttendancePer = ((presentCount + lateCount) / classes.length) * 100;
+      avgAttendancePer = totalAttendanceRecords > 0 ? ((presentCount + lateCount) / totalAttendanceRecords) * 100 : 0;
     }
 
     const calculateAvg = (items) => {
@@ -885,7 +767,7 @@ exports.getStudentGradesForSubject = async (req, res, next) => {
         avgMarksPer: assStats.percentage,
         avgGrade: assStats.grade,
       },
-      attendance: { classes, avgAttendancePer, presentCount, absentCount, lateCount }
+      attendance: { classes: formattedClasses, avgAttendancePer, presentCount, absentCount, lateCount }
     });
   } catch (err) {
     next(err);
@@ -897,24 +779,40 @@ exports.getStudentGradesForSubject = async (req, res, next) => {
 exports.getStudentSubjects = async (req, res, next) => {
   try {
     const { studentID } = req.params;
+    console.log("getStudentSubjects hit for studentID:", studentID);
 
-    const student = await User.findById(studentID);
+    if (!studentID || studentID === "undefined" || studentID === "null") {
+      console.log("Invalid studentID received");
+      return res.status(400).send("Invalid student ID");
+    }
 
-    const classrooms = await Classroom.find({ students: student._id })
-      .populate("teachers.subject")
-      .populate("teachers.teacher");
+    const student = await prisma.user.findUnique({ where: { id: studentID } });
+    if (!student) {
+      console.log("Student not found for ID:", studentID);
+      return res.status(404).send("Student not found");
+    }
+
+    console.log("Student found:", student.name, "Subjects:", student.subjects);
+
+    const classrooms = await prisma.classroom.findMany({
+      where: { students: { some: { id: studentID } } },
+      include: {
+        teachers: {
+          include: { subject: true, teacher: true }
+        }
+      }
+    });
 
     const subjects = classrooms.reduce((result, classroom) => {
       if (classroom.teachers && classroom.teachers.length > 0) {
         classroom.teachers.forEach((teacher) => {
           if (teacher.subject) {
-            // Only push the subject if the student is actively enrolled in it
-            const studentSubjects = student.subjects ? student.subjects.map(s => s.toString()) : [];
-            if (studentSubjects.includes(teacher.subject._id.toString())) {
+            const studentSubjects = student.subjects || [];
+            if (studentSubjects.includes(teacher.subject.id)) {
               result.push({
                 subject: teacher.subject,
                 teacher: teacher.teacher.name,
-                teacherId: teacher.teacher._id,
+                teacherId: teacher.teacher.id,
               });
             }
           }
@@ -923,35 +821,23 @@ exports.getStudentSubjects = async (req, res, next) => {
       return result;
     }, []);
 
+    const classes = await prisma.class.findMany({
+      where: { attendance: { some: { studentID: studentID } } },
+      include: { attendance: { where: { studentID: studentID } } },
+      orderBy: { startTime: 'asc' }
+    });
 
-
-    const classes = await Class.find({
-      attendance: { $elemMatch: { studentID: studentID } }
-    }).sort({ startTime: 1 });
-
-    // Use a Map to ensure unique subjects based on subject ID
     const uniqueSubjectsMap = new Map();
 
     subjects.forEach((item) => {
-      if (!item.subject || !item.subject._id) return;
+      if (!item.subject || !item.subject.id) return;
 
-      const subjectIdStr = item.subject._id.toString();
-
-      // If we haven't processed this subject yet, or if needed to handle multiple teachers for same subject (logic depends on requirements, 
-      // but "same subject name... to a same teacher" implies we just want one entry per subject-teacher combo).
-      // The previous issue was that it was looping through `classes` and pushing for EVERY class match.
-
-      // Let's create a unique key based on SubjectID + TeacherName to be safe, 
-      // or just SubjectID if the student only sees the subject once regardless of teacher.
-      // Based on the user complaint "same subject name showing for time to a same teacher", 
-      // it means even for the SAME teacher it was duplicating.
+      const subjectIdStr = item.subject.id;
       const uniqueKey = `${subjectIdStr}-${item.teacher}`;
 
       if (!uniqueSubjectsMap.has(uniqueKey)) {
-
-        // Calculate average attendance for this specific subject across ALL classes
         const subjectClasses = classes.filter(cls =>
-          cls.subjectID && cls.subjectID.toString() === subjectIdStr
+          cls.subjectID === subjectIdStr
         );
 
         let avgAttendancePer = 0;
@@ -961,15 +847,10 @@ exports.getStudentSubjects = async (req, res, next) => {
           let totalClasses = 0;
 
           subjectClasses.forEach(cls => {
-            const attendanceRecord = cls.attendance.find(
-              (sub) => sub.studentID.toString() === studentID.toString()
-            );
-
-            // Only count this class if the student was marked in attendance (present or absent)
-            // If the record exists, they were marked.
+            const attendanceRecord = cls.attendance[0];
             if (attendanceRecord) {
               totalClasses++;
-              if (attendanceRecord.isPresent) {
+              if (attendanceRecord.isPresent || attendanceRecord.late) {
                 totalAttended++;
               }
             }
@@ -981,17 +862,17 @@ exports.getStudentSubjects = async (req, res, next) => {
         }
 
         uniqueSubjectsMap.set(uniqueKey, {
-          ...item,
+          id: item.subject.id,
+          name: item.subject.name,
+          teacher: item.teacher,
+          teacherId: item.teacherId,
           avgAttendancePer
         });
       }
     });
 
-    const newarr = Array.from(uniqueSubjectsMap.values());
-
-    console.log("new array is : ", newarr);
-
-    res.send({ subjects: newarr, assignedSubjects: student.subjects });
+    const uniqueSubjectsList = Array.from(uniqueSubjectsMap.values());
+    res.send({ subjects: uniqueSubjectsList, assignedSubjects: student.subjects });
   } catch (err) {
     next(err);
   }
@@ -1006,26 +887,14 @@ exports.getSubjectsWithLevel = async (req, res, next) => {
   try {
     const { levelID } = req.params;
 
+    const level = await prisma.level.findUnique({ where: { id: levelID } });
+    if (!level) return res.status(404).json({ message: "Level not found" });
 
-    // Fetch level name using levelID
-    const level = await Level.findById(levelID);
-    if (!level) {
-      return res.status(404).json({ message: "Level not found" });
-    }
+    const subjects = await prisma.subject.findMany({ where: { levelID } });
 
-    // Fetch all subjects associated with that levelID
-    const subjects = await Subject.find({ levelID });
-
-    // Format the result
-    const formattedSubjects = subjects.map((subject) => ({
-      _id: subject._id,
-      subjectName: subject.name,
-    }));
-
-    // Send response with level name and subject names
     res.status(200).send({
       levelName: level.name,
-      subjects: formattedSubjects,
+      subjects: subjects.map(s => ({ id: s.id, subjectName: s.name })),
     });
   } catch (err) {
     next(err);
@@ -1035,162 +904,96 @@ exports.getSubjectsWithLevel = async (req, res, next) => {
 
 exports.getTeachersForAdmin = async (req, res, next) => {
   try {
-    const teachers = await User.find({ userType: "teacher" });
-    const classrooms = await Classroom.find({})
-      .populate("teachers.subject")
-      .populate("teachers.teacher");
-
-
-
-    const classes = await Class.find({});
-
-    // teachers.forEach((teach) => {
-    //   let teacharr = classes.filter((c) => c.teacher.teacherID.toString() == teach._id.toString());
-    //   if (teacharr.length > 0) {
-    //     let count = teacharr.reduce((acum, resul) => (resul.teacher.status == "present"? acum.presents = acum.presents + 1 : acum.presents, acum) ,{presents: 0})
-    //     console.log(count);
-    //   }
-    // })
-
-    // get all assignments and quizes of the teacher
-    let assignments = await Assignment.find({
-      createdBy: { $in: teachers.map((tea) => tea._id) },
-      submissions: { $elemMatch: { marks: { $exists: true } } },
-    });
-    let quizes = await Quiz.find({
-      createdBy: { $in: teachers.map((tea) => tea._id) },
-      submissions: { $elemMatch: { marks: { $exists: true } } },
-    });
-
-    quizes = quizes.map((ass) => {
-      const marks =
-        (ass.submissions.reduce((total, sub) => {
-          return total + sub.marks;
-        }, 0) /
-          ass.totalMarks /
-          ass.submissions.length) *
-        100;
-
-      return {
-        ...ass._doc,
-        average: {
-          percentage: marks,
-          grade: marks > 90 ? "A" : "B",
-        },
-      };
-    });
-
-    assignments = assignments.map((ass) => {
-      const marks =
-        (ass.submissions.reduce((total, sub) => {
-          return total + sub.marks;
-        }, 0) /
-          ass.totalMarks /
-          ass.submissions.length) *
-        100;
-
-      return {
-        ...ass._doc,
-        average: {
-          percentage: marks,
-          grade: marks > 90 ? "A" : "B",
-        },
-      };
-    });
-
-
-    // push all assignments and quize to specific teacher in teachers in classroom
-    const teachersInClassroom = classrooms.reduce((result, classroom) => {
-      classroom.teachers.forEach((teacher) => {
-        if (!result[teacher?.teacher?._id]) {
-          result[teacher?.teacher?._id] = [];
+    const teachers = await prisma.user.findMany({ where: { userType: "teacher" } });
+    const classrooms = await prisma.classroom.findMany({
+      include: {
+        teachers: {
+          include: {
+            subject: true,
+            teacher: true
+          }
         }
+      }
+    });
 
-        let classData = classes.filter((c) => {
-          return (
-            c.teacher?.teacherID.toString() == teacher?.teacher?._id.toString() &&
-            c.classroomID == classroom?._id?.toString()
-          )
-        });
-        let attendnececount = {};
-        attendnececount = classData.reduce((acum, resul) => (resul.teacher.status == "present" ? acum.presents = acum.presents + 1 : acum.presents, acum), { presents: 0 })
-        // console.log(attendnececount);
+    const classes = await prisma.class.findMany({
+      include: { attendance: true }
+    });
 
-        let ass = assignments.filter((a) => {
-          return (
-            a.createdBy.toString() == teacher?.teacher?._id.toString() &&
-            a.classroomID.toString() == classroom?._id.toString()
-          );
-        });
+    const teacherIds = teachers.map(t => t.id);
+    const assignments = await prisma.assignment.findMany({
+      where: {
+        createdBy: { in: teacherIds },
+        submissions: { some: { marks: { not: null } } }
+      },
+      include: { submissions: true }
+    });
 
-        let ass2 =
-          ass.reduce((total, asi) => {
-            return total + asi.average.percentage;
-          }, 0) / ass.length;
+    const quizes = await prisma.quiz.findMany({
+      where: {
+        createdBy: { in: teacherIds },
+        submissions: { some: { marks: { not: null } } }
+      },
+      include: { submissions: true }
+    });
 
-        let qui = quizes.filter((a) => {
-          return (
-            a.createdBy.toString() == teacher?.teacher?._id.toString() &&
-            a.classroomID.toString() == classroom?._id.toString()
-          );
-        });
+    const calculateAvgPerf = (items) => {
+      items = items.map(item => {
+        const totalObtained = item.submissions.reduce((sum, s) => sum + (s.marks || 0), 0);
+        const totalMax = item.totalMarks * item.submissions.length;
+        const percentage = totalMax > 0 ? (totalObtained / totalMax) * 100 : 0;
+        return { ...item, avgPercentage: percentage };
+      });
+      return items;
+    };
 
-        let qui2 =
-          qui.reduce((total, asi) => {
-            return total + asi.average.percentage;
-          }, 0) / qui.length;
+    const processedAssignments = calculateAvgPerf(assignments);
+    const processedQuizzes = calculateAvgPerf(quizes);
 
-        result[teacher?.teacher?._id].push({
+    const result = {};
+
+    classrooms.forEach(classroom => {
+      classroom.teachers.forEach(ct => {
+        const tId = ct.teacherID;
+        if (!result[tId]) result[tId] = [];
+
+        const teacherClasses = classes.filter(c => c.teacherID === tId && c.classroomID === classroom.id);
+        const presentCount = teacherClasses.filter(c => c.teacherStatus === 'present').length;
+
+        const teacherAssignments = processedAssignments.filter(a => a.createdBy === tId && a.classroomID === classroom.id);
+        const assAvg = teacherAssignments.length > 0
+          ? teacherAssignments.reduce((acc, a) => acc + a.avgPercentage, 0) / teacherAssignments.length
+          : 0;
+
+        const teacherQuizzes = processedQuizzes.filter(q => q.createdBy === tId && q.classroomID === classroom.id);
+        const quizAvg = teacherQuizzes.length > 0
+          ? teacherQuizzes.reduce((acc, q) => acc + q.avgPercentage, 0) / teacherQuizzes.length
+          : 0;
+
+        result[tId].push({
           attendence: {
-            classData,
-            attendnececount
+            classData: teacherClasses,
+            attendnececount: { presents: presentCount }
           },
           assignments: {
-            count: ass.length,
-            percentage: ass2,
-            grade: ass2 > 90 ? "A" : "B",
+            count: teacherAssignments.length,
+            percentage: assAvg.toFixed(2),
+            grade: assAvg > 90 ? "A" : "B",
           },
           quizes: {
-            count: qui.length,
-            percentage: qui2,
-            grade: qui2 > 90 ? "A" : "B",
+            count: teacherQuizzes.length,
+            percentage: quizAvg.toFixed(2),
+            grade: quizAvg > 90 ? "A" : "B",
           },
-          subject: teacher.subject,
-          teacher: teacher.teacher,
+          subject: ct.subject,
+          teacher: ct.teacher,
           classroomName: classroom.name
         });
       });
-      return result;
-    }, {});
+    });
 
-    return res.send(teachersInClassroom);
-
-    // group assignments by createdBy and classroomID
-    // const groupedAssignments = assignments.reduce((result, assignment) => {
-    //   if (!result[assignment.createdBy]) {
-    //     result[assignment.createdBy] = {};
-    //   }
-    //   if (!result[assignment.createdBy][assignment.classroomID]) {
-    //     result[assignment.createdBy][assignment.classroomID] = [];
-    //   }
-    //   result[assignment.createdBy][assignment.classroomID].push(assignment);
-    //   return result;
-    // }, {});
-    // // group quizes by createdBy and classroomID
-    // const groupedQuizes = quizes.reduce((result, quiz) => {
-    //   if (!result[quiz.createdBy]) {
-    //     result[quiz.createdBy] = {};
-    //   }
-    //   if (!result[quiz.createdBy][quiz.classroomID]) {
-    //     result[quiz.createdBy][quiz.classroomID] = [];
-    //   }
-    //   result[quiz.createdBy][quiz.classroomID].push(quiz);
-    //   return result;
-    // }, {});
-
-    // res.send({ groupedAssignments, groupedQuizes });
+    res.send(result);
   } catch (err) {
-    console.log("error while getting all teacher si : ", err);
     next(err);
   }
 };
@@ -1199,64 +1002,24 @@ exports.getTeachersForAdmin = async (req, res, next) => {
 exports.getStudentReportsForAdmin = async (req, res, next) => {
   try {
     const { studentID } = req.params;
+    const student = await prisma.user.findUnique({ where: { id: studentID } });
+    if (!student) return res.status(404).send("Student not found");
 
-    const student = await User.findById(studentID);
-
-    if (!student) {
-      return res.status(404).send("Student not found");
-    }
-
-    // get all classrooms of student
-
-    const classroomsWithAssignmentsAndQuizes = await Classroom.aggregate([
-      {
-        $match: {
-          students: mongoose.Types.ObjectId(studentID),
+    const classrooms = await prisma.classroom.findMany({
+      where: { students: { some: { id: studentID } } },
+      include: {
+        assignments: {
+          include: { submissions: { where: { studentID } } }
         },
-      },
-      {
-        $lookup: {
-          from: "assignments", // Assuming the name of the assignments collection is "assignments"
-          localField: "_id",
-          foreignField: "classroomID",
-          as: "assignments",
-        },
-      },
-      {
-        $lookup: {
-          from: "quizzes", // Assuming the name of the quizzes collection is "quizzes"
-          localField: "_id",
-          foreignField: "classroomID",
-          as: "quizzes",
-        },
-      },
+        quizzes: {
+          include: { submissions: { where: { studentID } } }
+        }
+      }
+    });
 
-      {
-        $addFields: {
-          assignments: {
-            $filter: {
-              input: "$assignments",
-              as: "assignment",
-              cond: { $ifNull: ["$$assignment.submissions.marks", false] },
-            },
-          },
-          quizzes: {
-            $filter: {
-              input: "$quizzes",
-              as: "quiz",
-              cond: { $ifNull: ["$$quiz.submissions.marks", false] },
-            },
-          },
-        },
-      },
-    ]);
+    const activities = await prisma.activity.findMany({ where: { userID: studentID } });
 
-    // console.log("report for admin is : ", classroomsWithAssignmentsAndQuizes[0]);
-
-    // get activities of student
-    const activities = await Activity.find({ userID: studentID });
-
-    return res.send({ classroomsWithAssignmentsAndQuizes, activities });
+    res.send({ classrooms, activities });
   } catch (err) {
     next(err);
   }
@@ -1266,8 +1029,39 @@ exports.getStudentReportsForAdmin = async (req, res, next) => {
 exports.updateUserByAdmin = async (req, res, next) => {
   try {
     const { userID } = req.params;
-    const user = await User.findByIdAndUpdate(userID, req.body, {
-      new: true,
+    const { 
+      name, email, rollNo, phoneNumber, gender, 
+      guardianName, guardianEmail, guardianPhoneNumber, 
+      referenceNo, levelID, userType, profilePic, bio, password 
+    } = req.body;
+
+    const data = {};
+    if (name !== undefined) data.name = name;
+    if (email !== undefined) data.email = email;
+    if (rollNo !== undefined) data.rollNo = rollNo;
+    if (phoneNumber !== undefined) data.phoneNumber = phoneNumber;
+    if (gender !== undefined) data.gender = gender;
+    if (guardianName !== undefined) data.guardianName = guardianName;
+    if (guardianEmail !== undefined) data.guardianEmail = guardianEmail;
+    if (guardianPhoneNumber !== undefined) data.guardianPhoneNumber = guardianPhoneNumber;
+    if (referenceNo !== undefined) data.referenceNo = referenceNo;
+    if (profilePic !== undefined) data.profilePic = profilePic;
+    if (bio !== undefined) data.bio = bio;
+    
+    // Hash password if provided and not empty
+    if (password && password.trim() !== "") {
+      data.password = await bcrypt.hash(password, 10);
+    }
+    
+    // Prisma relation IDs should be null if empty string
+    if (levelID !== undefined) data.levelID = levelID === "" ? null : levelID;
+    
+    // Normalize userType if provided
+    if (userType !== undefined) data.userType = userType.toLowerCase();
+
+    const user = await prisma.user.update({
+      where: { id: userID },
+      data: data
     });
     res.send(user);
   } catch (err) {
@@ -1279,7 +1073,7 @@ exports.updateUserByAdmin = async (req, res, next) => {
 exports.deleteUserByAdmin = async (req, res, next) => {
   try {
     const { userID } = req.params;
-    const user = await User.findByIdAndDelete(userID);
+    const user = await prisma.user.delete({ where: { id: userID } });
     res.send(user);
   } catch (err) {
     next(err);
@@ -1291,23 +1085,21 @@ exports.subscribeToNotifications = async (req, res, next) => {
   try {
     const currUser = req.user;
     const { fcmToken } = req.body;
+    if (!fcmToken) return res.status(400).send("fcmToken is required");
 
-    if (!fcmToken) {
-      return res.status(400).send("fcmToken is required");
-    }
-
-    const foundDevice = await Device.findOne({
-      userID: currUser._id,
-      fcmToken,
+    let device = await prisma.device.findUnique({
+      where: { fcmToken: fcmToken }
     });
 
-    if (foundDevice) {
-      return res.status(200).send(foundDevice);
+    if (device && device.userID === currUser.id) {
+      return res.status(200).send(device);
     }
 
-    const device = new Device({ fcmToken, userID: currUser._id });
-
-    await device.save();
+    device = await prisma.device.upsert({
+      where: { fcmToken: fcmToken },
+      update: { userID: currUser.id },
+      create: { fcmToken, userID: currUser.id }
+    });
 
     return res.status(200).send(device);
   } catch (err) {
@@ -1317,23 +1109,28 @@ exports.subscribeToNotifications = async (req, res, next) => {
 
 exports.getStudentSubjectsForStudent = async (req, res, next) => {
   try {
-    const studentID = req.user._id;
-
-    const classrooms = await Classroom.find({ students: studentID })
-      .populate("teachers.subject")
-      .populate("teachers.teacher");
+    const studentID = req.user.id;
+    const classrooms = await prisma.classroom.findMany({
+      where: { students: { some: { id: studentID } } },
+      include: {
+        teachers: {
+          include: {
+            subject: true,
+            teacher: { select: { name: true } }
+          }
+        }
+      }
+    });
 
     const subjects = classrooms.reduce((result, classroom) => {
-      if (classroom.teachers && classroom.teachers.length > 0) {
-        classroom.teachers.forEach((teacher) => {
-          if (teacher.subject) {
-            result.push({
-              subject: teacher.subject,
-              teacher: teacher.teacher.name,
-            });
-          }
-        });
-      }
+      classroom.teachers.forEach((ct) => {
+        if (ct.subject) {
+          result.push({
+            subject: ct.subject,
+            teacher: ct.teacher.name,
+          });
+        }
+      });
       return result;
     }, []);
 
@@ -1345,158 +1142,78 @@ exports.getStudentSubjectsForStudent = async (req, res, next) => {
 
 exports.getStudentGradesForSubjectForStudent = async (req, res, next) => {
   try {
-    // get subjectID from params
     const { subjectID } = req.params;
-    const studentID = req.user._id;
+    const studentID = req.user.id;
 
-    const userAssignmentsAndQuizzes = await Classroom.aggregate([
-      {
-        $match: {
-          students: mongoose.Types.ObjectId(studentID),
+    const classrooms = await prisma.classroom.findMany({
+      where: { students: { some: { id: studentID } } },
+      include: {
+        assignments: {
+          where: { subjectID: subjectID },
+          include: { submissions: { where: { studentID: studentID } } }
         },
-      },
-      {
-        $lookup: {
-          from: "assignments",
-          localField: "_id",
-          foreignField: "classroomID",
-          as: "assignments",
-        },
-      },
-      {
-        $lookup: {
-          from: "quizzes",
-          localField: "_id",
-          foreignField: "classroomID",
-          as: "quizzes",
-        },
-      },
-      {
-        $project: {
-          assignments: {
-            $filter: {
-              input: "$assignments",
-              as: "assignment",
-              cond: { $eq: ["$$assignment.subjectID", mongoose.Types.ObjectId(subjectID)] }
-            }
-          },
-          quizzes: {
-            $filter: {
-              input: "$quizzes",
-              as: "quiz",
-              cond: { $eq: ["$$quiz.subjectID", mongoose.Types.ObjectId(subjectID)] }
-            }
-          }
+        quizzes: {
+          where: { subjectID: subjectID },
+          include: { submissions: { where: { studentID: studentID } } }
         }
       }
-    ]);
+    });
 
     const studentAssignments = [];
     const studentQuizzes = [];
 
-    if (userAssignmentsAndQuizzes.length > 0) {
-      const { assignments, quizzes } = userAssignmentsAndQuizzes[0];
-
-      assignments.forEach(ass => {
-        const submission = ass.submissions.find(s => s.studentID.toString() === studentID.toString());
+    classrooms.forEach(classroom => {
+      classroom.assignments.forEach(ass => {
+        const sub = ass.submissions[0];
         studentAssignments.push({
-          _id: ass._id,
+          id: ass.id,
           title: ass.title,
           totalMarks: ass.totalMarks,
-          obtainedMarks: submission?.marks,
-          feedback: submission?.feedback || "",
-          grade: submission?.grade,
+          obtainedMarks: sub?.marks,
+          feedback: sub?.feedback || "",
+          grade: sub?.grade,
           deadline: ass.dueDate,
-          isSubmitted: !!submission,
-          submittedAt: submission?.submittedAt
+          isSubmitted: !!sub,
+          submittedAt: sub?.submittedAt
         });
       });
-
-      quizzes.forEach(q => {
-        const submission = q.submissions.find(s => s.studentID.toString() === studentID.toString());
+      classroom.quizzes.forEach(q => {
+        const sub = q.submissions[0];
         studentQuizzes.push({
-          _id: q._id,
+          id: q.id,
           title: q.title,
           totalMarks: q.totalMarks,
-          obtainedMarks: submission?.marks,
-          feedback: submission?.feedback || "",
-          grade: submission?.grade,
+          obtainedMarks: sub?.marks,
+          feedback: sub?.feedback || "",
+          grade: sub?.grade,
           deadline: q.dueDate,
-          isSubmitted: !!submission,
-          submittedAt: submission?.submittedAt
+          isSubmitted: !!sub,
+          submittedAt: sub?.submittedAt
         });
       });
-    }
+    });
 
-    const pipeline = [
-      {
-        $match: {
-          subjectID: mongoose.Types.ObjectId(subjectID),
-          classroomID: { $in: await Classroom.find({ students: studentID }).distinct("_id") }
-        },
+    const classes = await prisma.class.findMany({
+      where: {
+        subjectID: subjectID,
+        classroom: { students: { some: { id: studentID } } }
       },
-      {
-        $project: {
-          matchedAttendance: {
-            $filter: {
-              input: "$attendance",
-              as: "attendance",
-              cond: {
-                $eq: ["$$attendance.studentID", mongoose.Types.ObjectId(studentID)],
-              },
-            },
-          },
-          title: 1,
-          startTime: 1,
-          endTime: 1,
-        },
-      },
-      {
-        $sort: { startTime: 1 }
-      }
-    ];
+      include: { attendance: { where: { studentID: studentID } } },
+      orderBy: { startTime: 'asc' }
+    });
 
-    const classes = await Class.aggregate(pipeline);
-
-    // Deduplicate sessions by startTime locally to ensure "one time" display
-    const sessionMap = new Map();
-    classes.forEach((item) => {
-      const timeKey = moment(item.startTime).format("YYYY-MM-DD HH:mm");
-      // If we have multiple docs for same time (e.g. within same minute), prefer the one with attendance data
-      const hasAttendance = item.matchedAttendance && item.matchedAttendance.length > 0;
-
-      if (!sessionMap.has(timeKey) || (!sessionMap.get(timeKey).hasData && hasAttendance)) {
-        sessionMap.set(timeKey, {
-          ...item,
-          hasData: hasAttendance
-        });
+    let presentCount = 0, absentCount = 0, lateCount = 0;
+    let totalAttendanceRecords = 0;
+    classes.forEach((c) => {
+      if (c.attendance.length > 0) {
+        totalAttendanceRecords++;
+        if (c.attendance[0].late) lateCount++;
+        else if (c.attendance[0].isPresent) presentCount++;
+        else absentCount++;
       }
     });
 
-    const uniqueClasses = Array.from(sessionMap.values());
-    let avgAttendencePer = 0;
-    let presentCount = 0;
-    let absentCount = 0;
-    let lateCount = 0;
-    let totalAttendanceRecords = uniqueClasses.length;
-
-    if (uniqueClasses.length > 0) {
-      uniqueClasses.forEach((item) => {
-        if (item.matchedAttendance.length > 0) {
-          if (item.matchedAttendance[0].late) {
-            lateCount++;
-          } else if (item.matchedAttendance[0].isPresent) {
-            presentCount++
-          } else {
-            absentCount++;
-          }
-        }
-      });
-    }
-
-    if (totalAttendanceRecords > 0) {
-      avgAttendencePer = ((presentCount + lateCount) / totalAttendanceRecords) * 100;
-    }
+    const avgAttendencePer = totalAttendanceRecords > 0 ? ((presentCount + lateCount) / totalAttendanceRecords) * 100 : 0;
 
     const calculateGrade = (per) => {
       if (per >= 90) return "A";
@@ -1506,16 +1223,6 @@ exports.getStudentGradesForSubjectForStudent = async (req, res, next) => {
       if (per >= 50) return "E";
       return "F";
     };
-
-    const mergedAttendanceRecordsForStudent = [
-      ...uniqueClasses.map(c => ({
-        matchedAttendance: c.matchedAttendance,
-        title: c.title,
-        startTime: c.startTime,
-        endTime: c.endTime,
-        type: "session"
-      }))
-    ];
 
     const calculateAvg = (items) => {
       const graded = items.filter(item => typeof item.obtainedMarks !== 'undefined' && item.obtainedMarks !== null);
@@ -1540,7 +1247,16 @@ exports.getStudentGradesForSubjectForStudent = async (req, res, next) => {
         avgMarksPer: assStats.percentage,
         avgGrade: assStats.grade,
       },
-      attendance: { classes: mergedAttendanceRecordsForStudent, avgAttendencePer, presentCount, absentCount, lateCount }
+      attendance: {
+        classes: classes.map(c => ({
+          matchedAttendance: c.attendance,
+          title: c.title,
+          startTime: c.startTime,
+          endTime: c.endTime,
+          type: "session"
+        })),
+        avgAttendencePer, presentCount, absentCount, lateCount
+      }
     });
   } catch (err) {
     next(err);
@@ -1557,11 +1273,12 @@ exports.updatePassword = async (req, res, next) => {
 
     // Hash the password before saving
     const hashedPassword = await bcrypt.hash(password, 10);
-    console.log(req.user._id, "user id in update password controller");
+    const userId = req.user?.id || req.user?._id;
+    console.log(userId, "user id in update password controller");
 
     // Update only the password field in the database
 
-    const user = await userRepository.findUserAndUpdatePasswordById(req.user._id, hashedPassword);
+    const user = await userRepository.findUserAndUpdatePasswordById(userId, hashedPassword);
 
     if (!user) {
       return res.status(404).send({ message: "User not found" });

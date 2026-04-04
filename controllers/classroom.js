@@ -1,250 +1,101 @@
-const Classroom = require("../models/classroom");
-const Subject = require("../models/subject");
-const Class = require("../models/class");
-const Chatroom = require("../models/chatroom");
-const Assignment = require("../models/assignment");    
-const Quiz = require("../models/quiz");
-const StudentPromote = require("../models/studentPromote");
-const Level = require("../models/level");
+const prisma = require("../db/prisma");
 const classroomRepository = require("../repositories/classroomRepository");
 const levelRepository = require("../repositories/levelRepository");
 const subjectRepository = require("../repositories/subjectRepository");
-const Attendance = require("../models/attendence");
 
 exports.createClassroom = async (req, res, next) => {
   try {
     const data = req.body;
+    const { headTeacher, students, teachers, levelID, name } = data;
 
-    const { headTeacher } = data;
-
-
-    if (
-      !data.name ||
-      !data.students ||
-      !data.teachers ||
-      data.students.length < 1 ||
-      data.teachers.length < 1
-    ) {
+    if (!name || !students || !teachers || students.length < 1 || teachers.length < 1) {
       return res.status(400).send("All fields are required");
     }
 
     const currUser = req.user;
 
-    //check if same name classroom exists in the same level
-    const classroomFound = await Classroom.findOne({
-      name: data.name,
-      levelID: data.levelID,
+    const classroomFound = await prisma.classroom.findFirst({
+      where: { name, levelID }
     });
-    if (classroomFound) {
-      return res.status(400).send("Classroom already exists");
-    }
+    if (classroomFound) return res.status(400).send("Classroom already exists");
 
-    const teachers = data.teachers;
-    const students = data.students;
+    let finalTeachers = teachers;
+    let subject = null;
 
-    let subject;
-    let level;
+    if (currUser.userType === "teacher") {
+      if (!data.subject) return res.status(400).send("Subject is required");
+      subject = await prisma.subject.findUnique({ where: { id: data.subject } });
+      if (!subject) return res.status(400).send("Subject does not exist");
 
-    //check if user is a teacher
-    if (currUser.userType == "teacher") {
-      if (!data.subject) {
-        return res.status(400).send("Subject is required");
-      }
-      //check if subject exists
-      subject = await Subject.findOne({ _id: data.subject });
-
-      if (!subject) {
-        return res.status(400).send("Subject does not exist");
-      }
-
-      data.teachers = [
-        {
-          teacher: currUser._id,
-          subject: data.subject,
-        },
-      ];
+      finalTeachers = [{
+        teacherID: currUser.id,
+        subjectID: data.subject,
+        type: "teacher"
+      }];
     } else {
-      if (!data.levelID) {
-        return res.status(400).send("Level is required");
-      }
+      if (!levelID) return res.status(400).send("Level is required");
+      const level = await prisma.level.findUnique({ where: { id: levelID } });
+      if (!level) return res.status(400).send("Level does not exist");
 
-      // check if level exists
-      level = await Level.findOne({ _id: data.levelID });
-      if (!level) {
-        return res.status(400).send("Level does not exist");
-      }
-
-      for (let i = 0; i < students.length; i++) {
-        const student = students[i];
-        const classroom = await Classroom.findOne({ students: student });
-        // if (classroom) {
-        //   return res
-        //     .status(400)
-        //     .send("Student is already in another classroom");
-        // }
-      }
-      //check if teacher is already in another classroom
-
-      for (let i = 0; i < teachers.length; i++) {
-        const teacher = teachers[i].teacher;
-        if (!teachers[i].subject) {
-          console.log("here in array loop")
-          return res.status(400).send("Subject is required");
-        }
-        const classroom = await Classroom.findOne({
-          "teachers.teacher": teacher,
-        });
-        // if (classroom) {
-        //   return res
-        //     .status(400)
-        //     .send("Teacher is already in another classroom");
-        // }
-      }
-    }
-
-    if (headTeacher) {
-      data.teachers = data.teachers.map((teacher) => ({
-        ...teacher,
-        type: teacher.teacher === headTeacher ? "head" : "teacher",
+      finalTeachers = teachers.map(t => ({
+        teacherID: t.teacher,
+        subjectID: t.subject,
+        type: t.type || (t.teacher === headTeacher ? "head" : "teacher")
       }));
     }
 
-    const classroom = new Classroom({ ...data, createdBy: currUser._id });
-
-    await classroom.save();
-
-    await teachers.map(async (tea) => {
-      const chatname = `${data.name} ${currUser.userType == "teacher"
-        ? " - " + subject.name
-        : (await Subject.findOne({ _id: tea.subject })).name
-        }`;
-
-      await Chatroom.create({
-        participants: [...students, tea.teacher],
-        name: chatname,
-        messages: [],
-        classroomID: classroom._id,
-      });
+    const classroom = await prisma.classroom.create({
+      data: {
+        name,
+        levelID,
+        createdBy: currUser.id,
+        students: {
+          connect: students.map(id => ({ id }))
+        },
+        teachers: {
+          create: finalTeachers
+        }
+      },
+      include: { teachers: { include: { subject: true } } }
     });
 
-    return res.status(201).send(classroom._doc);
+    // Create Chatrooms
+    for (const ct of classroom.teachers) {
+      const chatname = `${name} - ${ct.subject.name}`;
+      await prisma.chatRoom.create({
+        data: {
+          name: chatname,
+          classroomID: classroom.id,
+          participants: {
+            connect: [...students.map(id => ({ id })), { id: ct.teacherID }]
+          }
+        }
+      });
+    }
+
+    return res.status(201).send(classroom);
   } catch (err) {
     next(err);
   }
 };
 exports.getClassrooms = async (req, res, next) => {
   try {
-    const classroomsWithClasses = await Classroom.aggregate([
-      // Lookup to populate createdBy details
-      {
-        $lookup: {
-          from: "users", // Name of the users collection
-          localField: "createdBy",
-          foreignField: "_id",
-          as: "createdBy",
+    const classrooms = await prisma.classroom.findMany({
+      include: {
+        creator: true,
+        level: true,
+        students: true,
+        teachers: {
+          include: {
+            teacher: true,
+            subject: true
+          }
         },
-      },
-      {
-        $addFields: {
-          createdBy: { $arrayElemAt: ["$createdBy", 0] }, // Extract single createdBy object
-        },
-      },
-      // Lookup to populate level details
-      {
-        $lookup: {
-          from: "levels", // Name of the levels collection
-          localField: "levelID",
-          foreignField: "_id",
-          as: "level",
-        },
-      },
-      {
-        $addFields: {
-          level: { $arrayElemAt: ["$level", 0] }, // Extract single level object
-        },
-      },
-      // Lookup to populate student details
-      {
-        $lookup: {
-          from: "users", // Name of the users collection
-          localField: "students",
-          foreignField: "_id",
-          as: "students",
-        },
-      },
-      // Lookup to populate teacher details
-      {
-        $lookup: {
-          from: "users", // Name of the users collection
-          localField: "teachers.teacher",
-          foreignField: "_id",
-          as: "teacherDetails",
-        },
-      },
-      {
-        $lookup: {
-          from: "classes", // Assuming the name of the classes collection is "classes"
-          localField: "_id",
-          foreignField: "classroomID",
-          as: "classes",
-        },
-      },
-      {
-        $lookup: {
-          from: "subjects", // Name of the subjects collection
-          localField: "teachers.subject",
-          foreignField: "_id",
-          as: "subjectDetails",
-        },
-      },
-      // Format teachers array with populated fields
-      {
-        $addFields: {
-          teachers: {
-            $map: {
-              input: "$teachers",
-              as: "teacher",
-              in: {
-                type: "$$teacher.type",
-                teacher: {
-                  $arrayElemAt: [
-                    {
-                      $filter: {
-                        input: "$teacherDetails",
-                        as: "teacherDetail",
-                        cond: { $eq: ["$$teacherDetail._id", "$$teacher.teacher"] },
-                      },
-                    },
-                    0,
-                  ],
-                },
-                subject: {
-                  $arrayElemAt: [
-                    {
-                      $filter: {
-                        input: "$subjectDetails",
-                        as: "subjectDetail",
-                        cond: { $eq: ["$$subjectDetail._id", "$$teacher.subject"] },
-                      },
-                    },
-                    0,
-                  ],
-                },
-              },
-            },
-          },
-        },
-      },
-      // Cleanup fields (optional: remove unnecessary arrays)
-      {
-        $project: {
-          teacherDetails: 0,
-          subjectDetails: 0,
-        },
-      },
-    ]);
+        classes: true
+      }
+    });
 
-    res.status(200).json(classroomsWithClasses);
+    res.status(200).json(classrooms);
   } catch (err) {
     next(err);
   }
@@ -252,8 +103,8 @@ exports.getClassrooms = async (req, res, next) => {
 
 exports.getClassroomById = async (req, res, next) => {
   try {
-    const classroom = await Classroom.findById(req.params.id);
-
+    const classroom = await prisma.classroom.findUnique({ where: { id: req.params.id } });
+    if (!classroom) return res.status(404).send("Classroom not found");
     return res.status(200).send(classroom);
   } catch (err) {
     next(err);
@@ -475,50 +326,81 @@ exports.getClassroomById = async (req, res, next) => {
 exports.deleteClassroom = async (req, res, next) => {
   try {
     const currUser = req.user;
+    const classroomID = req.params.id;
 
-    // Fetch the classroom
-    const classroom = await Classroom.findById(req.params.id);
+    const classroom = await prisma.classroom.findUnique({ where: { id: classroomID } });
+    if (!classroom) return res.status(404).send({ message: "Classroom not found" });
 
-    if (!classroom) {
-      return res.status(404).send({ message: "Classroom not found" });
-    }
-
-    // Convert ObjectId to string for proper comparison
-    const createdBy = String(classroom.createdBy);
-    const currUserId = String(currUser._id);
-
-    // Authorization check
-    if (currUser.userType !== "admin" && createdBy !== currUserId) {
+    if (currUser.userType !== "admin" && classroom.createdBy !== currUser.id) {
       return res.status(401).send("Unauthorized");
     }
 
-    // If an admin created the classroom, only admin can delete it
-    if (createdBy !== currUserId && currUser.userType !== "admin") {
-      return res.status(401).send("Unauthorized");
-    }
+    // Prisma handles related deletions better with transactions or sequential calls
+    await prisma.$transaction([
+      // 1. Delete AttendanceRecords (Grandchild of Classroom via Attendance)
+      prisma.attendanceRecord.deleteMany({
+        where: { attendance: { entityId: classroomID, entityType: "classroom" } }
+      }),
+      // 2. Delete Attendance (Child of Classroom)
+      prisma.attendance.deleteMany({ where: { entityId: classroomID, entityType: "classroom" } }),
 
-    // Delete all classes in the classroom
-    await Class.deleteMany({ classroomID: req.params.id });
+      // 3. Delete ClassAttendance (Grandchild of Classroom via Class)
+      prisma.classAttendance.deleteMany({
+        where: { class: { classroomID } }
+      }),
+      // 4. Delete Classes (Child of Classroom)
+      prisma.class.deleteMany({ where: { classroomID } }),
 
-    // Delete the chatroom
-    await Chatroom.deleteMany({ classroomID: req.params.id });
+      // 5. Delete ChatRoomMessage (Grandchild of Classroom via ChatRoom)
+      prisma.chatRoomMessage.deleteMany({
+        where: { chatRoom: { classroomID } }
+      }),
+      // 6. Delete ChatRooms (Child of Classroom)
+      prisma.chatRoom.deleteMany({ where: { classroomID } }),
 
-    // Delete related assignments
-    await Assignment.deleteMany({ classroomID: req.params.id });
+      // 7. Delete AssignmentSubmissions (Grandchild of Classroom via Assignment)
+      prisma.assignmentSubmission.deleteMany({
+        where: { assignment: { classroomID } }
+      }),
+      // 8. Delete Files (Grandchild of Classroom via Assignment or Quiz)
+      prisma.file.deleteMany({
+        where: { OR: [{ assignment: { classroomID } }, { quiz: { classroomID } }] }
+      }),
+      // 9. Delete Assignments (Child of Classroom)
+      prisma.assignment.deleteMany({ where: { classroomID } }),
 
-    // Delete related quizzes
-    await Quiz.deleteMany({ classroomID: req.params.id });
+      // 10. Delete QuizSubmissions (Grandchild of Classroom via Quiz)
+      prisma.quizSubmission.deleteMany({
+        where: { quiz: { classroomID } }
+      }),
+      // 11. Delete Quizzes (Child of Classroom)
+      prisma.quiz.deleteMany({ where: { classroomID } }),
 
-    // Delete attendance records
-    await Attendance.deleteMany({ entityId: req.params.id, entityType: "classroom" });
+      // 12. Delete ClassroomTeachers (Child of Classroom)
+      prisma.classroomTeacher.deleteMany({ where: { classroomID } }),
 
-    // Delete related promotion history
-    await StudentPromote.deleteMany({
-      $or: [{ sourceClassroom: req.params.id }, { targetClassroom: req.params.id }]
-    });
+      // 13. Delete PromotedStudent (Grandchild of Classroom via StudentPromote)
+      prisma.promotedStudent.deleteMany({
+        where: { promotion: { OR: [{ sourceClassroomID: classroomID }, { targetClassroomID: classroomID }] } }
+      }),
+      // 14. Delete StudentPromote (Child of Classroom)
+      prisma.studentPromote.deleteMany({
+        where: { OR: [{ sourceClassroomID: classroomID }, { targetClassroomID: classroomID }] }
+      }),
 
-    // Delete the classroom
-    await Classroom.findByIdAndDelete(req.params.id);
+      // 15. Delete ArchivedReport Children
+      prisma.archivedAttendance.deleteMany({ where: { report: { OR: [{ sourceClassroomID: classroomID }, { targetClassroomID: classroomID }] } } }),
+      prisma.archivedAssignment.deleteMany({ where: { report: { OR: [{ sourceClassroomID: classroomID }, { targetClassroomID: classroomID }] } } }),
+      prisma.archivedQuiz.deleteMany({ where: { report: { OR: [{ sourceClassroomID: classroomID }, { targetClassroomID: classroomID }] } } }),
+      prisma.archivedClass.deleteMany({ where: { report: { OR: [{ sourceClassroomID: classroomID }, { targetClassroomID: classroomID }] } } }),
+      // 16. Delete ArchivedReport
+      prisma.archivedReport.deleteMany({
+        where: { OR: [{ sourceClassroomID: classroomID }, { targetClassroomID: classroomID }] }
+      }),
+
+      // 17. Finally, delete the Classroom itself
+      prisma.classroom.delete({ where: { id: classroomID } })
+    ]);
 
     return res.status(204).send({ message: "Classroom deleted successfully" });
   } catch (err) {
@@ -528,83 +410,29 @@ exports.deleteClassroom = async (req, res, next) => {
 
 exports.getClassroomsOfTeacher = async (req, res, next) => {
   try {
-    const teacherID = req.user._id;
+    const teacherID = req.user.id;
 
-    const classroomsWithClasses = await Classroom.aggregate([
-      {
-        $lookup: {
-          from: "users", // Collection where user data (teachers and students) is stored
-          localField: "createdBy",
-          foreignField: "_id",
-          as: "createdBy",
-        },
+    const classrooms = await prisma.classroom.findMany({
+      where: {
+        teachers: { some: { teacherID: teacherID } }
       },
-      {
-        $addFields: {
-          createdBy: {
-            $cond: {
-              if: { $isArray: "$createdBy" },
-              then: {
-                $mergeObjects: [
-                  { $arrayElemAt: ["$createdBy", 0] },
-                  { password: undefined }, // Exclude the password field
-                ],
-              },
-              else: null,
-            },
-          },
-        },
-      },
-      {
-        $match: {
-          "teachers.teacher": teacherID,
-        },
-      },
-      {
-        $lookup: {
-          from: "classes", // Assuming the name of the classes collection is "classes"
-          localField: "_id",
-          foreignField: "classroomID",
-          as: "classes",
-        },
-      },
-      {
-        $lookup: {
-          from: "users", // Assuming students' details are in the "users" collection
-          localField: "students",
-          foreignField: "_id",
-          as: "studentDetails", // Populate student details here
-        },
-      },
-      {
-        $lookup: {
-          from: "levels", // Reference the levels collection
-          localField: "levelID", // Match classroom's levelID with levels collection
-          foreignField: "_id", // Match with levels' _id
-          as: "levelDetails", // Populate level details
-        },
-      },
-      {
-        $addFields: {
-          levelName: {
-            $cond: {
-              if: { $gt: [{ $size: "$levelDetails" }, 0] }, // Check if levelDetails array is not empty
-              then: { $arrayElemAt: ["$levelDetails.name", 0] }, // Extract the level name
-              else: "", // Set an empty string if no levelID
-            },
-          },
-        },
-      },
-      {
-        $project: {
-          "createdBy.password": 0, // Exclude sensitive fields
-          "studentDetails.password": 0,
-          levelDetails: 0, // Exclude levelDetails array as we already have levelName
-        },
-      },
-    ]);
+      include: {
+        creator: { select: { id: true, name: true, email: true, userType: true } },
+        classes: true,
+        students: { select: { id: true, name: true, email: true, rollNo: true, subjects: true, profilePic: true } },
+        level: true,
+        teachers: true
+      }
+    });
 
-    return res.status(200).send(classroomsWithClasses);
+    // Formatting to match frontend expectations if necessary
+    const formatted = classrooms.map(c => ({
+      ...c,
+      levelName: c.level?.name || "",
+      studentDetails: c.students,
+    }));
+
+    return res.status(200).send(formatted);
   } catch (err) {
     next(err);
   }
@@ -619,80 +447,50 @@ exports.updateClassroom = async (req, res, next) => {
   try {
     const data = req.body;
     const classroomId = req.params.id;
+    const { headTeacher, students, teachers, levelID, name } = data;
 
-    if (!data.name || !data.students || !data.teachers || data.students.length < 1 || data.teachers.length < 1) {
+    if (!name || !students || !teachers || students.length < 1 || teachers.length < 1) {
       return res.status(400).send("All fields are required");
     }
 
     const currUser = req.user;
-    const existingClassroom = await classroomRepository.findClassroomById(classroomId);
+    const existingClassroom = await prisma.classroom.findUnique({ where: { id: classroomId } });
+    if (!existingClassroom) return res.status(404).send("Classroom not found");
 
-    if (!existingClassroom) {
-      return res.status(404).send("Classroom not found");
-    }
+    const classroomFound = await prisma.classroom.findFirst({
+      where: { name, levelID, id: { not: classroomId } }
+    });
+    if (classroomFound) return res.status(400).send("Classroom with same name exists in this level");
 
-    const classroomFound = await classroomRepository.findClassroomByNameAndLevel(data.name, data.levelID);
-    if (classroomFound && classroomFound._id.toString() !== classroomId) {
-      return res.status(400).send("Classroom with the same name already exists in the same level");
-    }
-
-    let subject;
-    let level;
-
+    let finalTeachers = teachers;
     if (currUser.userType === "teacher") {
-      if (!data.subject) {
-        return res.status(400).send("Subject is required");
-      }
-      subject = await subjectRepository.findSubjectById(data.subject);
-      if (!subject) {
-        return res.status(400).send("Subject does not exist");
-      }
-
-      data.teachers = [
-        {
-          teacher: currUser._id,
-          subject: data.subject,
-        },
-      ];
+      finalTeachers = [{
+        teacherID: currUser.id,
+        subjectID: data.subject,
+        type: "teacher"
+      }];
     } else {
-      if (!data.levelID) {
-        return res.status(400).send("Level is required");
-      }
-      level = await levelRepository.findLevelById(data.levelID);
-      if (!level) {
-        return res.status(400).send("Level does not exist");
-      }
-
-      const studentIds = data?.students?.map(student => student._id); // Assuming `student` has an `_id` property
-      const studentClassrooms = await classroomRepository.findClassroomsByStudentIds(studentIds);
-
-      for (const student of data.students) {
-        const studentClassroom = studentClassrooms?.find(classroom => classroom.studentId.toString() === student._id.toString());
-        if (studentClassroom && studentClassroom._id.toString() !== classroomId) {
-          return res.status(400).send("Student is already in another classroom");
-        }
-      }
-
-      // for (const teacher of data.teachers) {
-      //   const teacherClassroom = await classroomRepository.findTeacherClassroom(teacher.teacher);
-      //   if (teacherClassroom && teacherClassroom._id.toString() !== classroomId) {
-      //     return res.status(400).send("Teacher is already in another classroom");
-      //   }
-
-      //   if (!teacher.subject) {
-      //     return res.status(400).send("Subject is required for each teacher");
-      //   }
-      // }
-    }
-
-    if (data.headTeacher) {
-      data.teachers = data.teachers.map(teacher => ({
-        ...teacher,
-        type: teacher.teacher === data.headTeacher ? "head" : "teacher",
+      finalTeachers = teachers.map(t => ({
+        teacherID: t.teacher,
+        subjectID: t.subject,
+        type: t.type || (t.teacher === headTeacher ? "head" : "teacher")
       }));
     }
 
-    const updatedClassroom = await classroomRepository.updateClassroomById(classroomId, data);
+    const updatedClassroom = await prisma.classroom.update({
+      where: { id: classroomId },
+      data: {
+        name,
+        levelID,
+        students: {
+          set: students.map(id => ({ id }))
+        },
+        teachers: {
+          deleteMany: {},
+          create: finalTeachers
+        }
+      }
+    });
 
     return res.status(200).send(updatedClassroom);
   } catch (err) {
@@ -706,85 +504,44 @@ exports.updateClassroom = async (req, res, next) => {
 
 exports.getAllClassrooms = async (req, res) => {
   try {
-    const classrooms = await Classroom.find()
-      .populate({
-        path: "levelID",
-        select: "name", // Only get the name field from Level
-      })
-      .populate({
-        path: "students",
-        select: "name rollNo email gender phoneNumber subjects", // Select specific student fields
-      })
-      .populate({
-        path: "teachers.teacher",
-        select: "name email phoneNumber", // Select specific teacher fields
-      })
-      .populate({
-        path: "teachers.subject",
-        select: "name levelID", // Select specific subject fields
-      })
-      .populate({
-        path: "createdBy",
-        select: "name email userType", // Select specific admin/creator fields
-      })
-      .lean(); // Use lean() for better performance since we're only reading
-
-    // Transform the data to match your frontend structure
-    const transformedClassrooms = classrooms.map(classroom => ({
-      _id: classroom._id,
-      name: classroom.name,
-      levelID: classroom.levelID?._id,
-      level: classroom.levelID ? {
-        _id: classroom.levelID._id,
-        name: classroom.levelID.name
-      } : null,
-      students: classroom.students.map(student => ({
-        _id: student._id,
-        name: student.name,
-        rollNo: student.rollNo,
-        email: student.email,
-        gender: student.gender,
-        phoneNumber: student.phoneNumber,
-        subjectIDs: student.subjects || []
-      })),
-      teachers: classroom.teachers.map(teacherObj => ({
-        type: teacherObj.type,
-        teacher: {
-          _id: teacherObj.teacher._id,
-          name: teacherObj.teacher.name,
-          email: teacherObj.teacher.email,
-          phoneNumber: teacherObj.teacher.phoneNumber
+    const classrooms = await prisma.classroom.findMany({
+      include: {
+        level: true,
+        students: true,
+        teachers: {
+          include: {
+            teacher: true,
+            subject: true
+          }
         },
-        subject: teacherObj.subject ? {
-          _id: teacherObj.subject._id,
-          name: teacherObj.subject.name,
-          levelID: teacherObj.subject.levelID
-        } : null
+        creator: true
+      }
+    });
+
+    const transformed = classrooms.map(c => ({
+      id: c.id,
+      name: c.name,
+      levelID: c.levelID,
+      level: c.level,
+      students: c.students,
+      teachers: c.teachers.map(t => ({
+        type: t.type,
+        teacher: t.teacher,
+        subject: t.subject
       })),
-      createdBy: classroom.createdBy ? {
-        _id: classroom.createdBy._id,
-        name: classroom.createdBy.name,
-        email: classroom.createdBy.email,
-        userType: classroom.createdBy.userType
-      } : null
+      createdBy: c.creator
     }));
 
     res.status(200).json({
       success: true,
       message: "Classrooms fetched successfully",
-      data: transformedClassrooms,
-      count: transformedClassrooms.length
+      data: transformed,
+      count: transformed.length
     });
-
   } catch (error) {
-    console.error("Error fetching classrooms:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch classrooms",
-      error: error.message
-    });
+    res.status(500).json({ success: false, message: error.message });
   }
-}
+};
 
 
 
@@ -931,8 +688,12 @@ exports.getStudentAttendanceReport = async (req, res) => {
     const endDateObj = new Date(endDate);
     endDateObj.setHours(23, 59, 59, 999); // Include entire end day
 
-    // Find classroom and populate students
-    const classroom = await Classroom.findById(classroomId).populate('students');
+    // Find classroom and include students
+    const classroom = await prisma.classroom.findUnique({
+      where: { id: classroomId },
+      include: { students: true }
+    });
+    
     if (!classroom) {
       return res.status(404).json({
         success: false,
@@ -941,11 +702,17 @@ exports.getStudentAttendanceReport = async (req, res) => {
     }
 
     // Find all classes in the range with the given subject
-    const classes = await Class.find({
-      classroomID: classroomId,
-      subjectID: subjectId,
-      startEventDate: { $gte: startDateObj, $lte: endDateObj }
-    }).populate('subjectID', 'name');
+    const classes = await prisma.class.findMany({
+      where: {
+        classroomID: classroomId,
+        subjectID: subjectId,
+        startTime: { gte: startDateObj, lte: endDateObj }
+      },
+      include: { 
+        subject: true,
+        attendance: true
+      }
+    });
 
     if (!classes.length) {
       return res.status(200).json({
@@ -962,15 +729,10 @@ exports.getStudentAttendanceReport = async (req, res) => {
       const rawDate = new Date(classItem.startTime);
       const dateKey = rawDate.toISOString().split('T')[0]; // "YYYY-MM-DD"
 
-      // Log class date for debug purposes
-      console.log(`[${classItem.title}] Class Date: ${dateKey}`);
-
-      // Filter students who are enrolled in this subject
+      // Filter students who are enrolled in this subject (based on student.subjects array)
       const enrolledStudents = classroom.students.filter(student =>
         student.subjects && student.subjects.includes(subjectId)
       );
-
-      console.log(`Class: ${classItem.title}, Total students in classroom: ${classroom.students.length}, Enrolled in subject: ${enrolledStudents.length}`);
 
       // Process only enrolled students
       for (const student of enrolledStudents) {
@@ -979,7 +741,7 @@ exports.getStudentAttendanceReport = async (req, res) => {
         // Check if student has attendance record for this class
         if (classItem.attendance && classItem.attendance.length > 0) {
           const attendanceRecord = classItem.attendance.find(
-            att => att.studentID.toString() === student._id.toString()
+            att => att.studentID === student.id
           );
 
           if (attendanceRecord) {
@@ -990,19 +752,18 @@ exports.getStudentAttendanceReport = async (req, res) => {
               status = 'absent';
             }
           }
-          // If no attendance record found, status remains 'absent'
         }
 
         responseData.push({
-          studentId: student._id,
+          studentId: student.id,
           studentName: student.name,
           rollNo: student.rollNo || 'N/A',
           classroomName: classroom.name,
-          subjectId: classItem.subjectID._id,
-          subjectName: classItem.subjectID.name,
+          subjectId: classItem.subjectID,
+          subjectName: classItem.subject?.name || 'Subject',
           date: dateKey,
           status,
-          classId: classItem._id,
+          classId: classItem.id,
           classTitle: classItem.title
         });
       }

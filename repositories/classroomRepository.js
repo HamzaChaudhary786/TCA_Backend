@@ -1,32 +1,65 @@
-// classroomRepository.js
-const Classroom = require('../models/classroom');
-const Subject = require('../models/subject');
-const Level = require('../models/level');
+const prisma = require('../db/prisma');
 
 class ClassroomRepository {
     async findClassroomById(id) {
-        return await Classroom.findById(id);
+        return await prisma.classroom.findUnique({
+            where: { id: id }
+        });
     }
 
     async findClassroomByNameAndLevel(name, levelID) {
-        return await Classroom.findOne({ name, levelID });
+        return await prisma.classroom.findFirst({
+            where: { name, levelID }
+        });
     }
 
     async findClassroomsByStudentIds(studentIds) {
-        return await Classroom.findOne({ students: studentIds });
+        // If studentIds is an array, find classrooms that have ANY of these students
+        if (Array.isArray(studentIds)) {
+            return await prisma.classroom.findMany({
+                where: {
+                    students: {
+                        some: {
+                            id: { in: studentIds }
+                        }
+                    }
+                }
+            });
+        }
+        // If it's a single ID
+        return await prisma.classroom.findFirst({
+            where: {
+                students: {
+                    some: {
+                        id: studentIds
+                    }
+                }
+            }
+        });
     }
 
     async findTeacherClassroom(teacherId) {
-        return await Classroom.findOne({ "teachers.teacher": teacherId });
+        return await prisma.classroom.findFirst({
+            where: {
+                teachers: {
+                    some: {
+                        teacherID: teacherId
+                    }
+                }
+            }
+        });
     }
 
     async updateClassroomById(id, updateData) {
-        return await Classroom.findByIdAndUpdate(id, updateData, { new: true });
+        // Handle relational updates if necessary, but for now direct update
+        // Note: Prisma update requires specific structure for nested fields.
+        // This repository method might need to be more specific or 
+        // the controller needs to pass Prisma-compatible data.
+        return await prisma.classroom.update({
+            where: { id: id },
+            data: updateData
+        });
     }
-
-
-
-
 }
 
 module.exports = new ClassroomRepository();

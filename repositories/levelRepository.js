@@ -1,10 +1,10 @@
-const Level = require('../models/level');
-
+const prisma = require('../db/prisma');
 
 class LevelRepository {
-
     async findLevelById(levelId) {
-        return await Level.findById(levelId);
+        return await prisma.level.findUnique({
+            where: { id: levelId }
+        });
     }
 }
 

@@ -1,11 +1,4 @@
-const User = require("../models/user");
-const Classroom = require("../models/classroom");
-const Assignment = require("../models/assignment");
-const Quiz = require("../models/quiz");
-const Chatroom = require("../models/chatroom");
-const mongoose = require("mongoose");
-const Class = require("../models/class");
-const Attendance = require("../models/attendence");
+const prisma = require("../db/prisma");
 const moment = require("moment");
 
 exports.getStudentReportForParent = async (req, res, next) => {
@@ -23,27 +16,51 @@ exports.getStudentReportForParent = async (req, res, next) => {
       return "F";
     };
 
-    const user = await User.findById(studentID).select("-password");
-    const classroom = await Classroom.findById(classroomID);
-    if (!classroom) return res.status(404).send("Classroom not found");
+    const user = await prisma.user.findUnique({
+      where: { id: studentID },
+      select: {
+        id: true, name: true, email: true, userType: true, profilePic: true, rollNo: true,
+        // include other relevant fields, excluding password
+      }
+    });
 
-    const assignments = await Assignment.find({ classroomID, subjectID });
-    const quizes = await Quiz.find({ classroomID, subjectID });
+    if (!user) return res.status(404).send({ message: "Student not found" });
+
+    const classroom = await prisma.classroom.findUnique({
+      where: { id: classroomID }
+    });
+    if (!classroom) return res.status(404).send({ message: "Classroom not found" });
+
+    const assignments = await prisma.assignment.findMany({
+      where: { classroomID, subjectID },
+      include: { submissions: true }
+    });
+
+    const quizes = await prisma.quiz.findMany({
+      where: { classroomID, subjectID },
+      include: { submissions: true }
+    });
+
     const classFilter = { classroomID, subjectID };
     if (teacherID) {
-      classFilter["teacher.teacherID"] = teacherID;
+      classFilter.teacherID = teacherID;
     }
-    const classes = await Class.find(classFilter).sort({ startTime: 1 });
+
+    const classes = await prisma.class.findMany({
+      where: classFilter,
+      orderBy: { startTime: 'asc' },
+      include: { attendance: true }
+    });
 
     const mapDeliverable = (item) => {
-      const sub = item.submissions.find(s => s.studentID.toString() === studentID.toString());
+      const sub = item.submissions.find(s => s.studentID === studentID);
       const isGraded = typeof sub?.marks !== 'undefined' && sub?.marks !== null;
       let grade = sub?.grade;
       if (!grade && isGraded) {
         grade = calculateGrade((sub.marks / item.totalMarks) * 100);
       }
       return {
-        _id: item._id,
+        id: item.id,
         title: item.title,
         totalMarks: item.totalMarks,
         obtainedMarks: sub?.marks,
@@ -76,13 +93,11 @@ exports.getStudentReportForParent = async (req, res, next) => {
     let lateCount = 0;
 
     // Deduplicate sessions by startTime locally to ensure "one time" display
-    // Using a more robust key (YYYY-MM-DD HH:mm) to handle millisecond differences
     const sessionMap = new Map();
     classes.forEach((cls) => {
       const timeKey = moment(cls.startTime).format("YYYY-MM-DD HH:mm");
-      // If we have multiple documents for same time, prefer the one with more student attendance records
       const existing = sessionMap.get(timeKey);
-      const studentMatch = cls.attendance?.find(a => a.studentID.toString() === studentID.toString());
+      const studentMatch = cls.attendance?.find(a => a.studentID === studentID);
       const hasAttendance = !!studentMatch;
 
       if (!existing || (!existing.hasData && hasAttendance)) {
@@ -109,9 +124,8 @@ exports.getStudentReportForParent = async (req, res, next) => {
 
     const avgAttendancePer = totalAttendanceRecords > 0 ? ((presentCount + lateCount) / totalAttendanceRecords) * 100 : 0;
 
-
     res.send({
-      user: user._doc,
+      user: user,
       averageAssignmentMarks: {
         percentage: assStats.percentage,
         grade: assStats.grade,
@@ -138,32 +152,50 @@ exports.getParentChats = async (req, res, next) => {
   try {
     const { studentID } = req.params;
 
-    const classrooms = await Classroom.find({ students: studentID });
+    const classrooms = await prisma.classroom.findMany({
+      where: {
+        students: { some: { id: studentID } }
+      },
+      include: {
+        teachers: true
+      }
+    });
 
     const chatrooms = [];
 
-    // Use for...of loop instead of map to allow proper use of async/await
     for (const classroom of classrooms) {
       for (const teac of classroom.teachers) {
-        // Check if the chatroom already exists
-        const foundChat = await Chatroom.findOne({
-          participants: {
-            $all: [teac.teacher, req.user._id].map((id) =>
-              mongoose.Types.ObjectId(id)
-            ),
+        
+        // Find existing chat that involves both the teacher and the parent (req.user.id)
+        // Wait, chatroom model logic here. Let's find one that has both participants
+        const foundChats = await prisma.chatRoom.findMany({
+          where: {
+            AND: [
+              { participants: { some: { id: teac.teacherID } } },
+              { participants: { some: { id: req.user.id } } }
+            ]
           },
+          include: {
+            participants: { select: { id: true, name: true, profilePic: true } }
+          }
         });
 
+        // Filter for exactly those two? Or just anyone that has both is fine.
+        let foundChat = foundChats.find(c => c.participants.length === 2);
+
         if (!foundChat) {
-          // Create a new chatroom if not found
-          const chatroom = new Chatroom({
-            participants: [teac.teacher, req.user._id].map((id) =>
-              mongoose.Types.ObjectId(id)
-            ),
-            messages: [],
+          // Create chat room
+          const newChatroom = await prisma.chatRoom.create({
+            data: {
+              participants: {
+                connect: [{ id: teac.teacherID }, { id: req.user.id }]
+              }
+            },
+            include: {
+              participants: { select: { id: true, name: true, profilePic: true } }
+            }
           });
-          await chatroom.save();
-          chatrooms.push(chatroom);
+          chatrooms.push(newChatroom);
         } else {
           chatrooms.push(foundChat);
         }
@@ -180,13 +212,18 @@ exports.getChildrenOfParent = async (req, res, next) => {
   try {
     const { email } = req.params;
 
-    const parent = await User.findOne({ email }).select("-password");
+    const parent = await prisma.user.findUnique({
+      where: { email },
+    });
 
-    if (!parent) next({ message: "User not found" });
+    if (!parent) return next({ message: "User not found" });
 
-    const children = await User.find({ guardianEmail: parent.email }).select(
-      "-password"
-    );
+    const children = await prisma.user.findMany({
+      where: { guardianEmail: parent.email },
+      select: {
+        id: true, name: true, email: true, profilePic: true, userType: true, guardianName: true, rollNo: true
+      }
+    });
 
     res.send(children);
   } catch (error) {
@@ -198,12 +235,15 @@ exports.getChilSubjects = async (req, res, next) => {
   try {
     const { studentID } = req.params;
 
-    // Fetch classrooms and populate teachers' subjects and details
-    const classrooms = await Classroom.find({ students: studentID })
-      .populate("teachers.subject")
-      .populate("teachers.teacher");
+    const classrooms = await prisma.classroom.findMany({
+      where: { students: { some: { id: studentID } } },
+      include: {
+        teachers: {
+          include: { subject: true, teacher: true }
+        }
+      }
+    });
 
-    // Extract unique subjects, teachers, and classrooms from the data
     const subjects = classrooms.reduce((result, classroom) => {
       if (classroom.teachers && classroom.teachers.length > 0) {
         classroom.teachers.forEach((teacher) => {
@@ -219,27 +259,25 @@ exports.getChilSubjects = async (req, res, next) => {
       return result;
     }, []);
 
-    // Fetch all classes where the student has attendance records
-    const classes = await Class.find({
-      attendance: { $elemMatch: { studentID: studentID } },
+    const classes = await prisma.class.findMany({
+      where: {
+        attendance: { some: { studentID } }
+      },
+      include: { attendance: true }
     });
 
-    // Create a map to track aggregated attendance per subject
     const attendanceMap = new Map();
 
-    // Aggregate attendance records by subject and calculate percentage
     classes.forEach((cls) => {
-      const subjectID = cls.subjectID.toString();
+      const subjectID = cls.subjectID;
 
-      // Initialize attendance data for this subject if not already present
       if (!attendanceMap.has(subjectID)) {
         attendanceMap.set(subjectID, { totalClasses: 0, presentClasses: 0 });
       }
 
-      // Update the aggregated attendance data for the subject
       const attendanceData = attendanceMap.get(subjectID);
       cls.attendance.forEach((record) => {
-        if (record.studentID.toString() === studentID.toString()) {
+        if (record.studentID === studentID) {
           attendanceData.totalClasses++;
           if (record.isPresent) {
             attendanceData.presentClasses++;
@@ -248,26 +286,19 @@ exports.getChilSubjects = async (req, res, next) => {
       });
     });
 
-    // Calculate attendance percentage and store in the map
     attendanceMap.forEach((data, subjectID) => {
-      data.avgAttendancePer = (
-        (data.presentClasses / data.totalClasses) * 100
-      ).toFixed(0);
+      data.avgAttendancePer = data.totalClasses > 0 ? ((data.presentClasses / data.totalClasses) * 100).toFixed(0) : "0";
     });
 
-    // Merge attendance data with subjects, avoiding duplication
     const newarr = subjects.map((item) => {
-      const subjectData = attendanceMap.get(item.subject._id.toString());
+      const subjectData = attendanceMap.get(item.subject.id);
       if (subjectData) {
-        // Subject found in attendance records; merge the data
         return { ...item, avgAttendancePer: subjectData.avgAttendancePer };
       } else {
-        // Subject not found in attendance records; return as is
-        return item;
+        return { ...item, avgAttendancePer: "0" };
       }
     });
 
-    // Send the processed subjects as the response
     res.send({ subjects: newarr });
   } catch (err) {
     next(err);
@@ -275,54 +306,66 @@ exports.getChilSubjects = async (req, res, next) => {
 };
 
 
-exports.getParentChats;
-
-
-
-
-
-
-
 exports.getStudentLastDeliveredAssignmentReport = async (req, res, next) => {
   try {
     const { studentID } = req.params;
 
-    // Fetch student details
-    const user = await User.findById(studentID).select("-password");
+    const user = await prisma.user.findUnique({
+      where: { id: studentID },
+      select: {
+        id: true, name: true, email: true, profilePic: true, rollNo: true
+      }
+    });
+    
     if (!user) {
       return res.status(404).json({ message: "Student not found" });
     }
 
-    // Get all classrooms where the student is present
-    const classrooms = await Classroom.find({ students: studentID });
+    const classrooms = await prisma.classroom.findMany({
+      where: { students: { some: { id: studentID } } },
+      select: { id: true }
+    });
+    
     if (!classrooms || classrooms.length === 0) {
-      return res.status(404).json({ message: "No classrooms found for student" });
+      return res.status(200).json({ 
+        message: "No classrooms found for student", 
+        user, 
+        lastAssignment: null 
+      });
     }
 
-    const classroomIDs = classrooms.map(c => c._id);
+    const classroomIDs = classrooms.map(c => c.id);
 
-    // Fetch assignments and quizzes where the student has a GRADED submission
     const [assignments, quizzes] = await Promise.all([
-      Assignment.find({
-        classroomID: { $in: classroomIDs },
-        submissions: { $elemMatch: { studentID, marks: { $exists: true } } }
-      }).sort({ createdAt: -1 }).limit(1),
-      Quiz.find({
-        classroomID: { $in: classroomIDs },
-        submissions: { $elemMatch: { studentID, marks: { $exists: true } } }
-      }).sort({ createdAt: -1 }).limit(1)
+      prisma.assignment.findMany({
+        where: {
+          classroomID: { in: classroomIDs },
+          submissions: { some: { studentID, marks: { not: null } } }
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 1,
+        include: { submissions: true }
+      }),
+      prisma.quiz.findMany({
+        where: {
+          classroomID: { in: classroomIDs },
+          submissions: { some: { studentID, marks: { not: null } } }
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 1,
+        include: { submissions: true }
+      })
     ]);
 
-    // Combine and find the actual latest one
     const deliverables = [
-      ...assignments.map(a => ({ ...a._doc, type: "Assignment" })),
-      ...quizzes.map(q => ({ ...q._doc, type: "Quiz" }))
+      ...assignments.map(a => ({ ...a, type: "Assignment" })),
+      ...quizzes.map(q => ({ ...q, type: "Quiz" }))
     ].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
     let lastDeliverable = null;
     if (deliverables.length > 0) {
       const item = deliverables[0];
-      const submission = item.submissions.find(s => s.studentID.toString() === studentID);
+      const submission = item.submissions.find(s => s.studentID === studentID);
 
       const percentage = item.totalMarks > 0 ? ((submission.marks / item.totalMarks) * 100).toFixed(0) : 0;
       const grade = percentage >= 90 ? "A" : percentage >= 80 ? "B" : percentage >= 70 ? "C" : percentage >= 60 ? "D" : percentage >= 50 ? "E" : "F";
@@ -337,7 +380,7 @@ exports.getStudentLastDeliveredAssignmentReport = async (req, res, next) => {
     }
 
     res.send({
-      user: user._doc,
+      user: user,
       lastAssignment: lastDeliverable,
     });
   } catch (error) {
@@ -345,35 +388,46 @@ exports.getStudentLastDeliveredAssignmentReport = async (req, res, next) => {
   }
 };
 
-
-
-
-// ... existing code above ...
-
-// Removed duplicate function definition
-
-// ADD THIS AT THE BOTTOM ↓
 exports.getChildAssignments = async (req, res, next) => {
   try {
     const { studentID } = req.params;
 
-    const classrooms = await Classroom.find({ students: studentID });
+    const classrooms = await prisma.classroom.findMany({
+      where: { students: { some: { id: studentID } } },
+      select: { id: true }
+    });
+    
     if (!classrooms || classrooms.length === 0) {
-      return res.status(404).json({ message: "No classrooms found for student" });
+      return res.status(200).json({ 
+        message: "No classrooms found for student",
+        assignments: [],
+        quizzes: []
+      });
     }
 
-    const classroomIDs = classrooms.map((classroom) => classroom._id);
+    const classroomIDs = classrooms.map(c => c.id);
 
     const [assignments, quizzes] = await Promise.all([
-      Assignment.find({ classroomID: { $in: classroomIDs } }).populate("subjectID").populate("classroomID").sort({ createdAt: -1 }),
-      Quiz.find({ classroomID: { $in: classroomIDs } }).populate("subjectID").populate("classroomID").sort({ createdAt: -1 })
+      prisma.assignment.findMany({
+        where: { classroomID: { in: classroomIDs } },
+        include: { subject: true, classroom: true, submissions: true },
+        orderBy: { createdAt: 'desc' }
+      }),
+      prisma.quiz.findMany({
+        where: { classroomID: { in: classroomIDs } },
+        include: { subject: true, classroom: true, submissions: true },
+        orderBy: { createdAt: 'desc' }
+      })
     ]);
 
     const mapItem = (item) => {
-      const sub = item.submissions.find(s => s.studentID.toString() === studentID.toString());
+      const sub = item.submissions.find(s => s.studentID === studentID);
       const isGraded = typeof sub?.marks !== 'undefined' && sub?.marks !== null;
+      // remove submissions array from output to match previous format if desired
+      const out = { ...item };
+      delete out.submissions;
       return {
-        ...item._doc,
+        ...out,
         isSubmitted: !!sub,
         isGraded: isGraded,
         obtainedMarks: sub?.marks,

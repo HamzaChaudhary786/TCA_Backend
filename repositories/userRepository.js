@@ -1,22 +1,21 @@
-const User = require('../models/user');
-
+const prisma = require('../db/prisma');
 
 class UserRepository {
-
     async findUserAndUpdatePasswordById(id, hashedPassword) {
-        return await User.findByIdAndUpdate(
-            id,
-            {
+        return await prisma.user.update({
+            where: { id: id },
+            data: {
                 password: hashedPassword,
                 isFirstLogin: false
-            },
-            { new: true }
-        );
-    }
-    async getStudentRecordsByIds(studentIds) {
-        return await User.find({ _id: { $in: studentIds } });
+            }
+        });
     }
 
+    async getStudentRecordsByIds(studentIds) {
+        return await prisma.user.findMany({
+            where: { id: { in: studentIds } }
+        });
+    }
 }
 
 module.exports = new UserRepository();

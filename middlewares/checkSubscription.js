@@ -1,4 +1,3 @@
-const mongoose = require("mongoose");
 
 exports.checkSubscription = async (req, res, next) => {
     try {

@@ -1,20 +1,26 @@
-const Notification = require("../models/notification")
+const prisma = require("../db/prisma");
 
 exports.getNotifications = async (req, res) => {
   try {
-    const notifications = await Notification.find({
-      deliveredTo: req.user._id,
-    })
-      .populate("userID")
-      .sort({ createdAt: -1 });
+    const notifications = await prisma.notification.findMany({
+      where: {
+        deliveredTo: { some: { id: req.user.id } }
+      },
+      include: {
+        user: true,
+        readBy: true
+      },
+      orderBy: { createdAt: 'desc' }
+    });
 
     res.status(200).json(
       notifications.map((not) => {
+        const isRead = not.readBy.some(readUser => readUser.id === req.user.id);
         return {
-          ...not._doc,
+          ...not,
           deliveredTo: undefined,
           readBy: undefined,
-          isRead: not.readBy.includes(req.user._id),
+          isRead: isRead
         };
       })
     );
@@ -22,20 +28,27 @@ exports.getNotifications = async (req, res) => {
     res.status(500).json(err);
   }
 };
+
 exports.marksNotificationAsRead = async (req, res) => {
   try {
-    const notification = await Notification.findById(req.params.id);
-    if (!notification) {
-      return res.status(404).json("Notification not found");
-    }
+    const notification = await prisma.notification.findUnique({
+      where: { id: req.params.id },
+      include: { deliveredTo: true, readBy: true }
+    });
 
-    if (!notification.deliveredTo.includes(req.user._id)) {
-      return res.status(403).json("You can't read this notification");
-    }
+    if (!notification) return res.status(404).json("Notification not found");
 
-    if (!notification.readBy.includes(req.user._id)) {
-      notification.readBy.push(req.user._id);
-      await notification.save();
+    const isDelivered = notification.deliveredTo.some(u => u.id === req.user.id);
+    if (!isDelivered) return res.status(403).json("You can't read this notification");
+
+    const alreadyRead = notification.readBy.some(u => u.id === req.user.id);
+    if (!alreadyRead) {
+      await prisma.notification.update({
+        where: { id: req.params.id },
+        data: {
+          readBy: { connect: { id: req.user.id } }
+        }
+      });
     }
 
     res.status(200).json("Notification marked as read");
