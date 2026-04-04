@@ -1,5 +1,6 @@
 const axios = require("axios");
 const prisma = require("../../db/prisma");
+const { normalizePhoneNumber } = require("../../utils/whatsappUtils");
 
 const WA_URL = "https://graph.facebook.com/v22.0/1059127047279632/messages";
 const WHATSAPP_ACCESS_TOKEN = "EAAMjfiduOfMBQx7ZAcZC0gg9ZBFvkSVd1W0ut7ZCUYFPvRO0ciKTNbeeSwnuu0b8ZAZBG7529nZBN8ZCa4QXP7ZCJzbvqymbeDotXIj6dZCbAVqZCN0RoOkHlmFTX4vPryBqg1d6u3wpTX3BlQ8WySeVQL1o086kEu4hm8vUJ82mEExLxdvdapfgdZCreADUZBbTTBAZDZD";
@@ -28,6 +29,76 @@ const WA_HEADERS = {
     Authorization: `Bearer ${WHATSAPP_ACCESS_TOKEN}`,
     "Content-Type": "application/json",
 };
+
+// ─────────────────────────────────────────────
+// WhatsApp Helpers (Defined early for scope visibility)
+// ─────────────────────────────────────────────
+async function sendMessage(to, body) {
+    if (!to || !body) return console.warn("sendMessage: missing params");
+
+    try {
+        await axios.post(WA_URL, {
+            messaging_product: "whatsapp",
+            to,
+            type: "text",
+            text: { body },
+        }, { headers: WA_HEADERS });
+    } catch (err) {
+        // This is where you see (#131030) if the number is not in your Meta Sandbox allowed list
+        console.error("❌ sendMessage failed:", err.response?.data || err.message);
+    }
+}
+exports.sendMessage = sendMessage;
+
+function formatNotFound(type) {
+    return (
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `🔍 *No Students Found*\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n\n` +
+        (type === "email"
+            ? `No students are linked to this email address.\n\nPlease check the email and try again, or contact your school administrator.`
+            : `No students are linked to this phone number.\n\nTry sending your registered email address instead.`) +
+        `\n\n_Type *help* to see all options_`
+    );
+}
+
+function formatHelp() {
+    return (
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `🏫 *School Parent Portal*\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `How to get started:\n\n` +
+        `👋 Type *hi* — Find students by your phone number\n` +
+        `📧 Send your *email* — Find students by email address\n\n` +
+        `_Example: hello@gmail.com_\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━`
+    );
+}
+
+function fmtShort(date) {
+    return new Date(date).toLocaleDateString("en-GB", { day: "2-digit", month: "short" });
+}
+
+function attendanceBar(pct) {
+    const filled = Math.round(pct / 10);
+    return "▓".repeat(filled) + "░".repeat(10 - filled);
+}
+
+function formatSubmissionRow(a, icon) {
+    const scorePercent = a.totalMarks ? ((a.marksObtained / a.totalMarks) * 100).toFixed(0) : null;
+    const gradeLabel = a.grade ? ` | Grade: *${a.grade}*` : "";
+    const lateTag = a.isLate ? "\n   ⏰ _Late submission_" : "";
+    const feedbackLine = a.feedback ? `\n   💬 _${a.feedback}_` : "";
+
+    return (
+        `${icon} *${a.title}*\n` +
+        `   📚 ${a.subjectName}\n` +
+        `   📅 Due: ${fmtShort(a.dueDate)}  •  Submitted: ${fmtShort(a.submittedAt)}\n` +
+        `   ✅ Score: *${a.marksObtained}/${a.totalMarks}*${scorePercent ? ` (${scorePercent}%)` : ""}${gradeLabel}` +
+        lateTag +
+        feedbackLine
+    );
+}
 
 // ─────────────────────────────────────────────
 // GET - Webhook verification
@@ -97,8 +168,18 @@ exports.createWebHook = (req, res) => {
                     let students = cacheGet(cacheKey);
 
                     if (!students) {
+                        const normalizedFrom = normalizePhoneNumber(from);
+                        const localFormat = normalizedFrom.startsWith("92") ? "0" + normalizedFrom.slice(2) : normalizedFrom;
+
                         students = await prisma.user.findMany({
-                            where: { userType: "student", guardianPhoneNumber: from },
+                            where: {
+                                userType: "student",
+                                OR: [
+                                    { guardianPhoneNumber: from },
+                                    { guardianPhoneNumber: normalizedFrom },
+                                    { guardianPhoneNumber: localFormat }
+                                ]
+                            },
                             include: { level: { select: { name: true } } }
                         });
                         // Map structure for compatibility
@@ -153,120 +234,132 @@ exports.createWebHook = (req, res) => {
 // ATTENDANCE handler
 // ─────────────────────────────────────────────
 async function handleAttendance(from, studentID) {
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    try {
+        const thirtyDaysAgo = new Date();
+        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
 
-    const records = await prisma.classAttendance.findMany({
-        where: {
-            studentID: studentID,
-            class: { startTime: { gte: thirtyDaysAgo } }
-        },
-        include: {
-            class: {
-                include: { subject: true }
+        const records = await prisma.classAttendance.findMany({
+            where: {
+                studentID: studentID,
+                class: { startTime: { gte: thirtyDaysAgo } }
+            },
+            include: {
+                class: {
+                    include: { subject: true }
+                }
             }
+        });
+
+        const subjectMap = new Map();
+        for (const record of records) {
+            if (!record.class || !record.class.subject) continue;
+            const subjectName = record.class.subject.name;
+            if (!subjectMap.has(subjectName)) {
+                subjectMap.set(subjectName, { totalClasses: 0, presentCount: 0 });
+            }
+            const s = subjectMap.get(subjectName);
+            s.totalClasses++;
+            if (record.isPresent) s.presentCount++;
         }
-    });
 
-    const subjectMap = new Map();
-    for (const record of records) {
-        if (!record.class || !record.class.subject) continue;
-        const subjectName = record.class.subject.name;
-        if (!subjectMap.has(subjectName)) {
-            subjectMap.set(subjectName, { totalClasses: 0, presentCount: 0 });
+        const data = Array.from(subjectMap.entries()).map(([name, stats]) => ({
+            subjectName: name,
+            totalClasses: stats.totalClasses,
+            presentCount: stats.presentCount,
+            attendancePercentage: stats.totalClasses === 0 ? 0 : (stats.presentCount / stats.totalClasses) * 100
+        }));
+
+        if (!data.length) {
+            return sendMessage(from, "📭 No attendance data found for the last 30 days.");
         }
-        const s = subjectMap.get(subjectName);
-        s.totalClasses++;
-        if (record.isPresent) s.presentCount++;
+
+        const fmtDate = (d) => d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+        const today = new Date();
+
+        const rows = data.map((s) => {
+            const pct = s.attendancePercentage.toFixed(1);
+            const bar = attendanceBar(parseFloat(pct));
+            const status = parseFloat(pct) >= 75 ? "✅" : parseFloat(pct) >= 50 ? "⚠️" : "❌";
+            return `${status} *${s.subjectName}*\n` +
+                   `   ${bar} ${pct}%\n` +
+                   `   Present: ${s.presentCount} / ${s.totalClasses} classes`;
+        }).join("\n\n");
+
+        const message =
+            `━━━━━━━━━━━━━━━━━━━━\n` +
+            `📊 *ATTENDANCE REPORT*\n` +
+            `━━━━━━━━━━━━━━━━━━━━\n` +
+            `📅 ${fmtDate(thirtyDaysAgo)} → ${fmtDate(today)}\n\n` +
+            `${rows}\n\n` +
+            `━━━━━━━━━━━━━━━━━━━━\n` +
+            `✅ ≥75%  ⚠️ 50–74%  ❌ <50%`;
+
+        sendMessage(from, message);
+    } catch (err) {
+        console.error("handleAttendance Error:", err);
     }
-
-    const data = Array.from(subjectMap.entries()).map(([name, stats]) => ({
-        subjectName: name,
-        totalClasses: stats.totalClasses,
-        presentCount: stats.presentCount,
-        attendancePercentage: stats.totalClasses === 0 ? 0 : (stats.presentCount / stats.totalClasses) * 100
-    }));
-
-    if (!data.length) {
-        return sendMessage(from, "📭 No attendance data found for the last 30 days.");
-    }
-
-    const fmtDate = (d) => d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
-    const today = new Date();
-
-    const rows = data.map((s) => {
-        const pct = s.attendancePercentage.toFixed(1);
-        const bar = attendanceBar(parseFloat(pct));
-        const status = parseFloat(pct) >= 75 ? "✅" : parseFloat(pct) >= 50 ? "⚠️" : "❌";
-        return `${status} *${s.subjectName}*\n` +
-               `   ${bar} ${pct}%\n` +
-               `   Present: ${s.presentCount} / ${s.totalClasses} classes`;
-    }).join("\n\n");
-
-    const message =
-        `━━━━━━━━━━━━━━━━━━━━\n` +
-        `📊 *ATTENDANCE REPORT*\n` +
-        `━━━━━━━━━━━━━━━━━━━━\n` +
-        `📅 ${fmtDate(thirtyDaysAgo)} → ${fmtDate(today)}\n\n` +
-        `${rows}\n\n` +
-        `━━━━━━━━━━━━━━━━━━━━\n` +
-        `✅ ≥75%  ⚠️ 50–74%  ❌ <50%`;
-
-    sendMessage(from, message);
 }
 
 // ─────────────────────────────────────────────
 // ASSIGNMENTS handler
 // ─────────────────────────────────────────────
 async function handleAssignments(from, studentID) {
-    const fiveDaysAgo = new Date();
-    fiveDaysAgo.setDate(fiveDaysAgo.getDate() - 5);
+    try {
+        const fiveDaysAgo = new Date();
+        fiveDaysAgo.setDate(fiveDaysAgo.getDate() - 5);
 
-    const data = await getSubmissionData("assignment", studentID, fiveDaysAgo);
+        const data = await getSubmissionData("assignment", studentID, fiveDaysAgo);
 
-    if (!data.length) {
-        return sendMessage(from, "📭 No assignments submitted in the last 5 days.");
+        if (!data.length) {
+            return sendMessage(from, "📭 No assignments submitted in the last 5 days.");
+        }
+
+        const today = new Date();
+        const rows = data.map((a) => formatSubmissionRow(a, "📝")).join("\n\n");
+
+        const message =
+            `━━━━━━━━━━━━━━━━━━━━\n` +
+            `📂 *ASSIGNMENTS — LAST 5 DAYS*\n` +
+            `━━━━━━━━━━━━━━━━━━━━\n` +
+            `📅 ${fmtShort(fiveDaysAgo)} → ${fmtShort(today)}\n\n` +
+            `${rows}\n\n` +
+            `━━━━━━━━━━━━━━━━━━━━`;
+
+        sendMessage(from, message);
+    } catch (err) {
+        console.error("handleAssignments Error:", err);
     }
-
-    const today = new Date();
-    const rows = data.map((a) => formatSubmissionRow(a, "📝")).join("\n\n");
-
-    const message =
-        `━━━━━━━━━━━━━━━━━━━━\n` +
-        `📂 *ASSIGNMENTS — LAST 5 DAYS*\n` +
-        `━━━━━━━━━━━━━━━━━━━━\n` +
-        `📅 ${fmtShort(fiveDaysAgo)} → ${fmtShort(today)}\n\n` +
-        `${rows}\n\n` +
-        `━━━━━━━━━━━━━━━━━━━━`;
-
-    sendMessage(from, message);
 }
 
 // ─────────────────────────────────────────────
 // QUIZZES handler
 // ─────────────────────────────────────────────
 async function handleQuizzes(from, studentID) {
-    const fiveDaysAgo = new Date();
-    fiveDaysAgo.setDate(fiveDaysAgo.getDate() - 5);
+    try {
+        const fiveDaysAgo = new Date();
+        fiveDaysAgo.setDate(fiveDaysAgo.getDate() - 5);
 
-    const data = await getSubmissionData("quiz", studentID, fiveDaysAgo);
+        const data = await getSubmissionData("quiz", studentID, fiveDaysAgo);
 
-    if (!data.length) {
-        return sendMessage(from, "📭 No quizzes submitted in the last 5 days.");
+        if (!data.length) {
+            return sendMessage(from, "📭 No quizzes submitted in the last 5 days.");
+        }
+
+        const today = new Date();
+        const rows = data.map((a) => formatSubmissionRow(a, "📋")).join("\n\n");
+
+        const message =
+            `━━━━━━━━━━━━━━━━━━━━\n` +
+            `📋 *QUIZZES — LAST 5 DAYS*\n` +
+            `━━━━━━━━━━━━━━━━━━━━\n` +
+            `📅 ${fmtShort(fiveDaysAgo)} → ${fmtShort(today)}\n\n` +
+            `${rows}\n\n` +
+            `━━━━━━━━━━━━━━━━━━━━`;
+
+        sendMessage(from, message);
+    } catch (err) {
+        console.error("handleQuizzes Error:", err);
     }
-
-    const today = new Date();
-    const rows = data.map((a) => formatSubmissionRow(a, "📋")).join("\n\n");
-
-    const message =
-        `━━━━━━━━━━━━━━━━━━━━\n` +
-        `📋 *QUIZZES — LAST 5 DAYS*\n` +
-        `━━━━━━━━━━━━━━━━━━━━\n` +
-        `📅 ${fmtShort(fiveDaysAgo)} → ${fmtShort(today)}\n\n` +
-        `${rows}\n\n` +
-        `━━━━━━━━━━━━━━━━━━━━`;
-
-    sendMessage(from, message);
 }
 
 // ─────────────────────────────────────────────
@@ -300,28 +393,13 @@ async function getSubmissionData(modelName, studentID, sinceDate) {
 }
 
 // ─────────────────────────────────────────────
-// WhatsApp message senders
+// WhatsApp Interactive Replies
 // ─────────────────────────────────────────────
-async function sendMessage(to, body) {
-    if (!to || !body) return console.warn("sendMessage: missing params");
-
-    try {
-        await axios.post(WA_URL, {
-            messaging_product: "whatsapp",
-            to,
-            type: "text",
-            text: { body },
-        }, { headers: WA_HEADERS });
-    } catch (err) {
-        console.error("❌ sendMessage failed:", err.response?.data || err.message);
-    }
-}
-
 async function replyStudentList(to, students, messageId) {
     if (!to || !students?.length) return;
 
     const rows = students.slice(0, 10).map((s) => ({
-        id: `${s._id}`,
+        id: `${s.id}`,
         title: s.name,
         description: s.levelID?.name ? `🎓 Level: ${s.levelID.name}` : "Level not assigned",
     }));
@@ -413,56 +491,3 @@ exports.sendAdminBroadcast = async (req, res) => {
         res.status(500).json({ success: false, message: "Broadcast failed." });
     }
 };
-
-// ─────────────────────────────────────────────
-// Formatting helpers
-// ─────────────────────────────────────────────
-function fmtShort(date) {
-    return new Date(date).toLocaleDateString("en-GB", { day: "2-digit", month: "short" });
-}
-
-function attendanceBar(pct) {
-    const filled = Math.round(pct / 10);
-    return "▓".repeat(filled) + "░".repeat(10 - filled);
-}
-
-function formatSubmissionRow(a, icon) {
-    const scorePercent = a.totalMarks ? ((a.marksObtained / a.totalMarks) * 100).toFixed(0) : null;
-    const gradeLabel = a.grade ? ` | Grade: *${a.grade}*` : "";
-    const lateTag = a.isLate ? "\n   ⏰ _Late submission_" : "";
-    const feedbackLine = a.feedback ? `\n   💬 _${a.feedback}_` : "";
-
-    return (
-        `${icon} *${a.title}*\n` +
-        `   📚 ${a.subjectName}\n` +
-        `   📅 Due: ${fmtShort(a.dueDate)}  •  Submitted: ${fmtShort(a.submittedAt)}\n` +
-        `   ✅ Score: *${a.marksObtained}/${a.totalMarks}*${scorePercent ? ` (${scorePercent}%)` : ""}${gradeLabel}` +
-        lateTag +
-        feedbackLine
-    );
-}
-
-function formatNotFound(type) {
-    return (
-        `━━━━━━━━━━━━━━━━━━━━\n` +
-        `🔍 *No Students Found*\n` +
-        `━━━━━━━━━━━━━━━━━━━━\n\n` +
-        (type === "email"
-            ? `No students are linked to this email address.\n\nPlease check the email and try again, or contact your school administrator.`
-            : `No students are linked to this phone number.\n\nTry sending your registered email address instead.`) +
-        `\n\n_Type *help* to see all options_`
-    );
-}
-
-function formatHelp() {
-    return (
-        `━━━━━━━━━━━━━━━━━━━━\n` +
-        `🏫 *School Parent Portal*\n` +
-        `━━━━━━━━━━━━━━━━━━━━\n\n` +
-        `How to get started:\n\n` +
-        `👋 Type *hi* — Find students by your phone number\n` +
-        `📧 Send your *email* — Find students by email address\n\n` +
-        `_Example: hello@gmail.com_\n\n` +
-        `━━━━━━━━━━━━━━━━━━━━`
-    );
-}

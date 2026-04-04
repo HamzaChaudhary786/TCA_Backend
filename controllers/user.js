@@ -107,25 +107,53 @@ exports.login = async (req, res, next) => {
         levelName = level ? level.name : null;
       }
 
-      // --- DYNAMIC SUBSCRIPTION CHECK ---
+      // --- 1. INDIVIDUAL BLOCK CHECK ---
+      if (foundUser.isBlocked) {
+        return res.status(403).send({ message: "Your account has been blocked. Please contact the administrator." });
+      }
+
+      // --- 2. DYNAMIC SUBSCRIPTION & ORGANIZATION FEE CHECK ---
       if (foundUser.userType !== 'super_admin') {
-        let subscriptionUser = foundUser;
+        let organization = foundUser;
 
         if (foundUser.userType !== 'admin') {
-          const adminUser = await prisma.user.findFirst({ where: { userType: 'admin' } });
-          if (adminUser) {
-            subscriptionUser = adminUser;
-          }
+          // In a single-tenant system, the organization is the 'admin' user
+          organization = await prisma.user.findFirst({ where: { userType: 'admin' } });
         }
 
-        const isSubscriptionActive = subscriptionUser.subscriptionExpiresAt &&
-          new Date(subscriptionUser.subscriptionExpiresAt) > new Date();
+        if (!organization) {
+          // This should not happen in a configured system
+          return res.status(403).send({ message: "Organization setup incomplete. Please contact support." });
+        }
 
-        if (!isSubscriptionActive) {
+        const isSubscriptionExpired = organization.subscriptionExpiresAt &&
+          new Date(organization.subscriptionExpiresAt) < new Date();
+        
+        const isFeesPaid = organization.feesPaid;
+
+        if (isSubscriptionExpired || !isFeesPaid) {
           const msg = foundUser.userType === 'admin'
-            ? "Your subscription has expired. Please renew to continue."
-            : "School subscription has expired. Please contact the administrator.";
+            ? "Your organization's subscription has expired or fees are unpaid. Please contact support."
+            : "The school/organization access is currently suspended due to unpaid fees. Please contact your administrator.";
           return res.status(403).send({ message: msg });
+        }
+      }
+
+      // --- STUDENT FEE CHECK ---
+      if (foundUser.userType === 'student') {
+        const overdueFee = await prisma.fee.findFirst({
+          where: {
+            studentID: foundUser.id,
+            status: 'unpaid',
+            dueDate: { lt: new Date() }
+          }
+        });
+
+        if (overdueFee) {
+          return res.status(403).send({ 
+            message: "Access Denied: You have unpaid fees. Please contact the administrator or check your parent portal.",
+            feeStatus: "unpaid"
+          });
         }
       }
 
@@ -1004,7 +1032,7 @@ exports.updateUserByAdmin = async (req, res, next) => {
     const { 
       name, email, rollNo, phoneNumber, gender, 
       guardianName, guardianEmail, guardianPhoneNumber, 
-      referenceNo, levelID, userType, profilePic, bio 
+      referenceNo, levelID, userType, profilePic, bio, password 
     } = req.body;
 
     const data = {};
@@ -1019,6 +1047,11 @@ exports.updateUserByAdmin = async (req, res, next) => {
     if (referenceNo !== undefined) data.referenceNo = referenceNo;
     if (profilePic !== undefined) data.profilePic = profilePic;
     if (bio !== undefined) data.bio = bio;
+    
+    // Hash password if provided and not empty
+    if (password && password.trim() !== "") {
+      data.password = await bcrypt.hash(password, 10);
+    }
     
     // Prisma relation IDs should be null if empty string
     if (levelID !== undefined) data.levelID = levelID === "" ? null : levelID;

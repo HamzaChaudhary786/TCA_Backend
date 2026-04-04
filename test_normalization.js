@@ -1,18 +1,14 @@
-const normalizeEmail = (email) => email.trim().toLowerCase();
+const { normalizePhoneNumber } = require('./utils/whatsappUtils');
 
-const mockUser = {
-  email: "admin@example.com"
-};
+const testNumbers = [
+    '03068361835',
+    '923068361835',
+    '+923068361835',
+    '3068361835',
+    '00923068361835'
+];
 
-function testNormalization(inputEmail) {
-  const normalizedInput = normalizeEmail(inputEmail);
-  const isMatch = normalizedInput === mockUser.email;
-  console.log(`Input: [${inputEmail}] -> Normalized: [${normalizedInput}] -> Match: ${isMatch}`);
-  return isMatch;
-}
-
-console.log("Testing email normalization logic...");
-testNormalization("admin@example.com");
-testNormalization("Admin@example.com");
-testNormalization(" ADMIN@EXAMPLE.COM ");
-testNormalization("admin@Example.com");
+console.log('--- Normalization Tests ---');
+testNumbers.forEach(n => {
+    console.log(`Original: ${n.padEnd(15)} | Normalized: ${normalizePhoneNumber(n)}`);
+});

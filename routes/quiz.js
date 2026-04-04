@@ -21,6 +21,11 @@ quizRouter.get("/all/student", quizController.getAllQuizzesOfStudent);
 // get quiz for grading
 quizRouter.get("/submissions/:quizID", quizController.getQuizForGrading);
 
+// check plagiarism for a quiz
+quizRouter.get("/check-plagiarism/:quizID", quizController.checkPlagiarism);
+// check single student submission for AI + plagiarism
+quizRouter.get("/check-submission/:quizID/:studentID", quizController.checkSingleSubmission);
+
 // specific routes before generic :id
 quizRouter.post("/submit/:id", quizController.submitQuiz);
 quizRouter.post("/grade/:id", quizController.gradeQuizes);

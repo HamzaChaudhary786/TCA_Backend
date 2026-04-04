@@ -107,7 +107,8 @@ model User {
   classAttendance        ClassAttendance[]
   classesTaught          Class[]                @relation("ClassTeacher")
   classesCreated         Class[]                @relation("ClassCreator")
-  archivedReports        ArchivedReport[]
+  archivedReports      ArchivedReport[]
+  fees                 Fee[]                  @relation("StudentFees")
 
   @@index([userType, guardianEmail])
   @@index([userType, guardianPhoneNumber])
@@ -549,4 +550,23 @@ model SystemSetting {
   enableHeadAttendance Boolean  @default(false)
   updatedAt            DateTime @updatedAt
   createdAt            DateTime @default(now())
+}
+
+model Fee {
+  id          String   @id @default(uuid())
+  studentID   String
+  student     User     @relation("StudentFees", fields: [studentID], references: [id])
+  amount      Float
+  month       Int?     // 1-12 for monthly
+  year        Int
+  type        String   // "monthly", "yearly", "admission", etc.
+  status      String   @default("unpaid") // "paid", "unpaid"
+  dueDate     DateTime
+  paidAt      DateTime?
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([studentID])
+  @@index([status])
 }

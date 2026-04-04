@@ -3,6 +3,9 @@ const assignmentRouter = require("express").Router();
 
 assignmentRouter.post("/", assignmentController.createAssignment);
 
+// DIAGNOSTIC: Move single submission check to top to rule out route shadowing
+assignmentRouter.get("/check-submission/:assignmentID/:studentID", assignmentController.checkSingleSubmission);
+
 // get assignments of classroom
 assignmentRouter.get(
   "/all/classroom/:classroomID",
@@ -29,6 +32,10 @@ assignmentRouter.get(
   "/submissions/:assignmentID",
   assignmentController.getAssignmentForGrading
 );
+
+// check plagiarism for an assignment
+assignmentRouter.get("/check-plagiarism/:assignmentID", assignmentController.checkPlagiarism);
+// check single student submission for AI + plagiarism
 
 // specific routes before generic :id
 assignmentRouter.post("/submit/:id", assignmentController.submitAssignment);

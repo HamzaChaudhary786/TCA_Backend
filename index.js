@@ -49,6 +49,10 @@ var app = express();
 app.set("trust proxy", 1);
 let isProduction = process.env.NODE_ENV == "production";
 app.use(logger("dev"));
+app.use((req, res, next) => {
+  console.log(`[DEBUG-ROUTING] Incoming Request: ${req.method} ${req.url}`);
+  next();
+});
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
@@ -92,7 +96,7 @@ app.use(passport.session());
 app.use("/api/auth/", authRouter);
 app.use("/api/subscription", checkLoggedIn, require("./routes/subscription"));
 app.use("/api/level/", levelRouter);
-app.use("/api/quiz/", checkLoggedIn, quizRouter);
+app.use("/api/quiz", checkLoggedIn, quizRouter);
 app.use("/api/user/", checkLoggedIn, userRouter);
 app.use("/api/class/",
   checkLoggedIn,
@@ -104,8 +108,7 @@ app.use(
   "/api/classroom/attendence",
   checkLoggedIn,
   attendenceRouter);
-app.use("/api/assignment/", checkLoggedIn, assignmentRouter);
-app.use("/api/assignment/", checkLoggedIn, assignmentRouter);
+app.use("/api/assignment", checkLoggedIn, assignmentRouter);
 app.use("/api/settings/", checkLoggedIn, settingsRouter);
 app.use("/api/notification/", checkLoggedIn, notificationRouter);
 app.use("/api/announcement/", checkLoggedIn, announcementRouter);
@@ -116,6 +119,7 @@ app.use("/api/chatroom/", checkLoggedIn, require("./routes/chatroom"));
 app.use("/webhook", require("./routes/whatsapp/whatsapp"));
 app.use("/api/admin/", checkLoggedIn, promoteRouter);
 app.use("/api/stats/", checkLoggedIn, require("./routes/stats"));
+app.use("/api/fees/", checkLoggedIn, require("./routes/fees"));
 
 const aiLimiter = rateLimit({
   windowMs: 60 * 1000,
